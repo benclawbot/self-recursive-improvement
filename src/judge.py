@@ -31,7 +31,7 @@ def _call_m27(prompt: str, max_tokens: int = 600) -> str:
     body = json.dumps({
         "model": JUDGE_MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
+        "max_tokens": 1500,
         "temperature": 0.2,  # low temp for consistent judging
     }).encode()
 
@@ -50,7 +50,12 @@ def _call_m27(prompt: str, max_tokens: int = 600) -> str:
 
 
 def _parse_verdict(raw: str) -> dict:
-    """The judge is asked to emit strict JSON. We tolerate mild wrapping."""
+    """The judge is asked to emit strict JSON. We tolerate mild wrapping
+    AND <think>...</think> blocks (m2.7 emits these too)."""
+    import re
+    raw = raw.strip()
+    # Strip <think>...</think> blocks (both m2.7 and m3 emit these)
+    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
     raw = raw.strip()
     # Strip ```json fences if present
     if raw.startswith("```"):
