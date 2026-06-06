@@ -191,7 +191,36 @@ stops improving. The loop is *designed* to keep Thomas in the loop
 until the override rate drops below 10% — at which point the digest
 will tell you, and you can choose to widen auto-approval criteria.
 
-## Known limitations
+## Security
+
+This loop is plumbing for an AI agent's self-modification. By design it
+writes to skill files and memory. Treat its permissions accordingly.
+
+**Required environment variables (never commit):**
+- `MINIMAX_API_KEY` — used by `propose.py`, `judge.py`, `self_improve.py`
+- `TELEGRAM_BOT_TOKEN` — used by `digest.py`
+
+Both are read via `os.environ.get(...)` and never persisted. The
+`.gitignore` excludes `.env`, `*.log`, and the runtime database.
+
+**Audit the data directory before sharing.** `data/loop.db` accumulates
+proposals, judge verdicts, and your override notes. It's gitignored,
+but if you copy the repo elsewhere (USB, zip), scrub it first.
+
+**Threat model:**
+- A pinned-skill change requires explicit approval and a backup.
+- A skill file outside `~/.hermes/skills/` is rejected.
+- A path outside `$HOME` or `/tmp` is rejected.
+- A `.env` or credential file is never read by the loop.
+
+**What this is NOT:** it does not sandbox the LLM. The m3 proposer can
+emit any diff it wants; the rubric and judge catch most bad ones, but
+your override is the last line of defense. Read the weekly digest.
+
+**Forking:** the loop's calibration is specific to one user (thomas).
+If you fork it, start with override_rate=undefined, expect to spend
+the first month tuning the rubric, and treat the proposer's early
+output as low-trust.
 
 - **Session content is large.** 200+ message sessions get head+tail
   truncated, missing middle. Recurring patterns in the middle can be
