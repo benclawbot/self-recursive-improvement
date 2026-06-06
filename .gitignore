@@ -1,0 +1,28 @@
+# Runtime state — not source
+data/loop.db
+data/loop.db-journal
+data/loop.db-wal
+data/loop.db-shm
+data/backups/
+
+# Logs
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~
+
+# Test artifacts
+/tmp/loop_diff_*
