@@ -4,7 +4,7 @@
 # Exit non-zero on failure → cron sends error alert to thomas.
 
 set -e
-cd /home/thomas/self-recursive-improvement || exit 1
+cd /home/thomas/Recursive-Self-Improvement || exit 1
 
 LOG=logs/cycle_$(date -u +%Y%m%d_%H%M%S).log
 

@@ -1,5 +1,5 @@
 """
-SQLite state store for the self-recursive-improvement loop.
+SQLite state store for the recursive self-improvement loop.
 
 Schema tracks:
   - proposals: candidate changes (skill patches, memory entries, rubric updates)

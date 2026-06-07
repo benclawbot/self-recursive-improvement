@@ -271,7 +271,7 @@ check("applied_outcomes.cycle_id is set", cid is not None, f"got {cid}")
 import subprocess
 r = subprocess.run(
     ["python3", "src/apply.py", "--revert", cid],
-    cwd="/home/thomas/self-recursive-improvement",
+    cwd="/home/thomas/Recursive-Self-Improvement",
     capture_output=True, text=True,
 )
 check("apply.py --revert exit 0", r.returncode == 0, f"stderr: {r.stderr[:200]}")

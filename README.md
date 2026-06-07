@@ -1,4 +1,4 @@
-# self-recursive-improvement
+# Recursive Self Improvement
 
 An autonomous, *self-improving* agent loop. Built so an AI agent (Hermes /
 MiniMax-M3) can propose changes to its own skills, memory, and judging
@@ -218,7 +218,7 @@ skills (under `~/.hermes/skill-assets/`) are never auto-modified.
 ## Files
 
 ```
-self-recursive-improvement/
+Recursive-Self-Improvement/
 ├── README.md                  # this file
 ├── docs/
 │   └── roadmap-to-v2.md       # Phase 5+ spec
@@ -279,7 +279,7 @@ python3 src/apply.py --prune-branches 10 # drop oldest 10 (safe ones only)
 python3 src/loop.py --self-improve --dry-run
 
 # Manually trigger the weekly digest (sends to Telegram)
-cd ~/self-recursive-improvement && source ~/.hermes/.env && python3 src/digest.py
+cd ~/Recursive-Self-Improvement && source ~/.hermes/.env && python3 src/digest.py
 ```
 
 ## Environment
@@ -309,10 +309,10 @@ The loop runs as four jobs in `~/.hermes/cron/jobs.json`:
 
 Manual cron entries (if running outside Hermes):
 ```cron
-0 */8 * * *   cd ~/self-recursive-improvement && python3 src/loop.py --skip-apply >> logs/cron.log 2>&1
-0 4 * * *    cd ~/self-recursive-improvement && python3 src/apply.py >> logs/cron.log 2>&1
-0 9 * * 1    cd ~/self-recursive-improvement && source ~/.hermes/.env && python3 src/digest.py >> logs/cron.log 2>&1
-0 10 1 * *   cd ~/self-recursive-improvement && python3 src/self_improve.py >> logs/cron.log 2>&1
+0 */8 * * *   cd ~/Recursive-Self-Improvement && python3 src/loop.py --skip-apply >> logs/cron.log 2>&1
+0 4 * * *    cd ~/Recursive-Self-Improvement && python3 src/apply.py >> logs/cron.log 2>&1
+0 9 * * 1    cd ~/Recursive-Self-Improvement && source ~/.hermes/.env && python3 src/digest.py >> logs/cron.log 2>&1
+0 10 1 * *   cd ~/Recursive-Self-Improvement && python3 src/self_improve.py >> logs/cron.log 2>&1
 ```
 
 ## Design choices and trade-offs
