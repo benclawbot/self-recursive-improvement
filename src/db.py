@@ -14,8 +14,12 @@ import json
 import time
 from contextlib import contextmanager
 from pathlib import Path
+import os as _os
 
-DB_PATH = Path(__file__).parent.parent / "data" / "loop.db"
+# Allow tests (and overrides) to redirect the DB via env. Otherwise tests
+# pollute the prod data/loop.db with dummy proposals on every run.
+_DEFAULT_DB = Path(__file__).parent.parent / "data" / "loop.db"
+DB_PATH = Path(_os.environ.get("SRI_DB_PATH", str(_DEFAULT_DB)))
 
 
 SCHEMA = """

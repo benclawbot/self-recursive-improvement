@@ -35,7 +35,11 @@ from typing import Iterable
 
 import db
 
-BRANCHES_DIR = Path(__file__).parent.parent / "data" / "branches"
+# Allow tests (and overrides) to redirect branches to a temp dir via env.
+# Otherwise the prod data/branches/ gets polluted on every test run.
+import os as _os
+_DEFAULT_BRANCHES = Path(__file__).parent.parent / "data" / "branches"
+BRANCHES_DIR = Path(_os.environ.get("SRI_BRANCHES_DIR", str(_DEFAULT_BRANCHES)))
 BRANCH_META = "_meta.json"  # written in each branch dir; lists what was snapshotted
 
 

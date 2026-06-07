@@ -20,8 +20,21 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+# CRITICAL: redirect prod paths to temp dirs BEFORE importing the modules.
+# db.DB_PATH and branch.BRANCHES_DIR are evaluated at import time, so env
+# vars must be set first or the constants freeze to the prod paths.
+_TEST_ROOT = Path(tempfile.mkdtemp(prefix="sri_test_root_"))
+os.environ["SRI_DB_PATH"] = str(_TEST_ROOT / "loop.db")
+os.environ["SRI_BRANCHES_DIR"] = str(_TEST_ROOT / "branches")
+os.environ["SRI_BACKUP_DIR"] = str(_TEST_ROOT / "backups")
+
 import db
 import branch
+
+# Assert the env-var override actually took effect. If DB_PATH points at
+# the prod data/loop.db, all subsequent test writes will pollute it.
+assert str(db.DB_PATH).startswith("/tmp/"), f"DB_PATH not redirected! Got: {db.DB_PATH}"
+assert str(branch.BRANCHES_DIR).startswith("/tmp/"), f"BRANCHES_DIR not redirected! Got: {branch.BRANCHES_DIR}"
 
 
 PASS = "✓"
@@ -64,7 +77,7 @@ tmp = Path(tempfile.mkdtemp(prefix="sri_t2_"))
 t2 = tmp / "a.md"; t2.write_text("ORIGINAL_A")
 t2b = tmp / "b.md"; t2b.write_text("ORIGINAL_B")
 cid = branch.cycle_start([t2, t2b])
-branch_dir = Path("data/branches") / cid
+branch_dir = branch.BRANCHES_DIR / cid
 check("branch dir exists", branch_dir.exists())
 check("_meta.json exists", (branch_dir / "_meta.json").exists())
 check("snapshot of a.md exists", (branch_dir / t2).exists())
@@ -80,7 +93,7 @@ print("\n[3] cycle_start tracks created-in-cycle files")
 tmp = Path(tempfile.mkdtemp(prefix="sri_t3_"))
 new_file = tmp / "new.md"  # does NOT exist
 cid = branch.cycle_start([new_file])
-branch_dir = Path("data/branches") / cid
+branch_dir = branch.BRANCHES_DIR / cid
 meta = json.loads((branch_dir / "_meta.json").read_text())
 check("new file recorded in created_in_cycle", str(new_file) in meta["created_in_cycle"])
 check("new file NOT in snapshotted", str(new_file) not in meta["snapshotted"])
@@ -241,6 +254,16 @@ skill_md = real_test_skill_dir / "SKILL.md"
 skill_md.write_text("---\nname: sri-test-skill\n---\n# sri-test\nORIGINAL_LINE\n")
 test_path = str(skill_md)
 
+# Clear out any leftover proposals from earlier tests so apply.run()
+# only processes the one we're about to add. Earlier tests intentionally
+# leave proposals in 'merged' state to assert branch/list_branches behavior,
+# so we wipe everything to give apply.run() a clean slate.
+with db.conn() as c:
+    c.execute("DELETE FROM judge_verdicts")
+    c.execute("DELETE FROM thomas_feedback")
+    c.execute("DELETE FROM applied_outcomes")
+    c.execute("DELETE FROM proposals")
+
 pid = db.add_proposal(
     target_kind="skill_patch",
     target_path=test_path,
@@ -272,6 +295,7 @@ import subprocess
 r = subprocess.run(
     ["python3", "src/apply.py", "--revert", cid],
     cwd="/home/thomas/Recursive-Self-Improvement",
+    env={**os.environ, "SRI_DB_PATH": str(db.DB_PATH), "SRI_BRANCHES_DIR": str(branch.BRANCHES_DIR), "SRI_BACKUP_DIR": os.environ["SRI_BACKUP_DIR"]},
     capture_output=True, text=True,
 )
 check("apply.py --revert exit 0", r.returncode == 0, f"stderr: {r.stderr[:200]}")

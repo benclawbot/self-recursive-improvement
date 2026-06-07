@@ -27,9 +27,15 @@ import db
 import branch
 
 
+import os as _os_apply
+
 HERMES_SKILLS = Path.home() / ".hermes" / "skills"
 HERMES_MEMORIES = Path.home() / ".hermes" / "memories"
-BACKUP_DIR = Path(__file__).parent.parent / "data" / "backups"
+# Backup dir is per-process state. Allow tests (and overrides) to redirect
+# to a temp dir via env. Otherwise test runs leak DONE_#N_... markers into
+# the prod backup dir and break idempotency on subsequent runs.
+_DEFAULT_BACKUP_DIR = Path(__file__).parent.parent / "data" / "backups"
+BACKUP_DIR = Path(_os_apply.environ.get("SRI_BACKUP_DIR", str(_DEFAULT_BACKUP_DIR)))
 LOG_FILE = Path(__file__).parent.parent / "logs" / "apply.log"
 
 
