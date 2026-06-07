@@ -4,6 +4,7 @@ data/loop.db-journal
 data/loop.db-wal
 data/loop.db-shm
 data/backups/
+data/judge_state.json
 
 # Logs
 logs/

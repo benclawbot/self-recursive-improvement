@@ -29,6 +29,7 @@ import self_improve
 import grade_outcomes
 import memory_hygiene
 import incident_watcher
+import checkpoint
 
 
 def cycle(skip_apply: bool = False, judge_only: bool = False,
@@ -36,6 +37,15 @@ def cycle(skip_apply: bool = False, judge_only: bool = False,
           dry_run: bool = False, max_sessions: int = 3) -> dict:
     started_at = time.time()
     db.init_db()
+    # Load prior judge calibration state (cheap, restores baseline if
+    # the process restarted). Stale (>24h) is reported as stale, not silent.
+    prior = checkpoint.load()
+    if prior:
+        print(f"  [checkpoint] loaded prior state: {checkpoint.fmt_for_log(prior)}")
+        if prior.get("_stale"):
+            print(f"  [checkpoint] WARNING: state is {prior.get('age_hours', 0):.1f}h old, treating as stale")
+    else:
+        print("  [checkpoint] no prior state on disk; calibrating from scratch")
     result: dict = {"steps": [], "_started_at": started_at}
     counters = {
         "proposals_mined": 0,
@@ -133,6 +143,16 @@ def _finalize(result: dict, counters: dict, started_at: float) -> dict:
                 **counters,
                 error=error,
             )
+            # Save judge calibration checkpoint. Skip propose-only runs
+            # (no judge step) and dry-runs (no real data). Real cycles
+            # + judge-only runs both write fresh state.
+            steps_run = set(result.get("steps", []))
+            if "judge" in steps_run:
+                try:
+                    saved = checkpoint.save()
+                    print(f"  [checkpoint] saved: {checkpoint.fmt_for_log(saved)}")
+                except Exception as ckpt_exc:
+                    print(f"  [checkpoint] save failed (non-fatal): {ckpt_exc}")
     except Exception as e:
         # Last-resort: don't let the stats-recorder break the cycle
         print(f"[loop] warning: failed to record cycle_stats: {e}")

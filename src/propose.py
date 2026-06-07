@@ -29,10 +29,14 @@ PROPOSER_MODEL = "MiniMax-M3"  # The main model proposes
 API_URL = "https://api.minimax.io/v1/chat/completions"
 
 
-def _call_m3(system: str, user: str, max_tokens: int = 4000) -> dict:
+def _call_m3(system: str, user: str, max_tokens: int = 1500) -> dict:
     """Returns {'content': str, 'input_tokens': int|None, 'output_tokens': int|None, 'ms': int}.
     Token counts come from the API response's `usage` field; missing/None
     if the API doesn't return them (e.g. older models or stream mode).
+
+    `max_tokens=1500` keeps the proposer call under the 60s urllib
+    timeout. Proposals are short JSONL (typically 5-15 lines per
+    proposal); 4000 was overkill and let m3 ramble past the budget.
     """
     api_key = os.environ.get("MINIMAX_API_KEY")
     if not api_key:
@@ -55,7 +59,7 @@ def _call_m3(system: str, user: str, max_tokens: int = 4000) -> dict:
         method="POST",
     )
     t0 = time.monotonic()
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=60) as resp:
         data = json.loads(resp.read())
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     usage = data.get("usage") or {}

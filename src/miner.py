@@ -41,8 +41,14 @@ def session_id_from_path(p: Path) -> str:
     return p.stem
 
 
-def load_session(path: Path, max_msgs: int = 60) -> tuple:
-    """Load a session file. Returns (session_id, msg_count, messages)."""
+def load_session(path: Path, max_msgs: int = 30) -> tuple:
+    """Load a session file. Returns (session_id, msg_count, messages).
+
+    Caps at 30 messages (head 15 + tail 15) to keep the proposer LLM
+    call under the 60s urllib timeout. Anything bigger gets mined from
+    the digest anyway; the patterns surface from the first 15 and the
+    last 15, which is where the framing and outcome live.
+    """
     sid = session_id_from_path(path)
     messages = []
     with open(path) as f:
@@ -59,10 +65,10 @@ def load_session(path: Path, max_msgs: int = 60) -> tuple:
                 })
             except json.JSONDecodeError:
                 continue
-    # Truncate long sessions: head 20 + tail (max-20)
+    # Truncate long sessions: head 15 + tail 15
     if len(messages) > max_msgs:
-        head = messages[:20]
-        tail = messages[-(max_msgs - 20):]
+        head = messages[:15]
+        tail = messages[-(max_msgs - 15):]
         omitted = len(messages) - max_msgs
         messages = head + [{
             "role": "system",
@@ -73,11 +79,23 @@ def load_session(path: Path, max_msgs: int = 60) -> tuple:
 
 
 def unmined_sessions(limit: int = 5, min_age_hours: float = 1.0,
-                     min_messages: int = 6) -> list:
-    """Find sessions worth mining: unmined, old enough, big enough."""
+                     min_messages: int = 6, max_messages: int = 200,
+                     scan_window: int = 200) -> list:
+    """Find sessions worth mining: unmined, old enough, big enough, not too big.
+
+    `max_messages` filter exists because very long sessions (200+ msgs)
+    are usually long implementation sessions whose patterns surface in
+    the digest anyway. Mining them is more LLM cost than insight.
+
+    `scan_window` controls how many recent session files we look at
+    before giving up. With many already-mined or oversized sessions
+    in the recent window, a small multiplier (`limit * 4`) used to miss
+    eligible candidates entirely. 200 is a generous cap that still
+    keeps the scan O(filenames-glob) cheap.
+    """
     from db import was_session_mined
     out = []
-    for path in list_sessions(min_age_hours=min_age_hours, limit=limit * 4):
+    for path in list_sessions(min_age_hours=min_age_hours, limit=scan_window):
         sid = session_id_from_path(path)
         if was_session_mined(sid):
             continue
@@ -88,6 +106,8 @@ def unmined_sessions(limit: int = 5, min_age_hours: float = 1.0,
         except OSError:
             continue
         if msg_count < min_messages:
+            continue
+        if msg_count > max_messages:
             continue
         out.append((sid, path, msg_count))
         if len(out) >= limit:
