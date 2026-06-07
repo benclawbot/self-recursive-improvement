@@ -81,10 +81,46 @@ CREATE TABLE IF NOT EXISTS lessons_learned (
     sent_in_digest_at REAL            -- nullable; weekly digest marks sent
 );
 
+-- Negative patterns: written when thomas rejects or overrides the judge.
+-- These are the "things to avoid" the proposer should see on the next cycle.
+-- Distinct from lessons_learned (which captures positive insights).
+CREATE TABLE IF NOT EXISTS negative_patterns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at REAL NOT NULL,
+    proposal_id INTEGER NOT NULL,
+    target_kind TEXT NOT NULL,
+    target_path TEXT,
+    reason TEXT NOT NULL,             -- thomas's note (or 'overridden' if blank)
+    was_overrides_judge BOOLEAN NOT NULL,
+    used_in_prompt_at REAL,           -- last time we injected this in a proposer prompt
+    FOREIGN KEY (proposal_id) REFERENCES proposals(id)
+);
+
+-- Outcome measurement: every applied change is logged here so we can
+-- later grade whether the change actually helped. Outcomes are detected
+-- by miner/cycle: reverts in backups, re-corrections of the same target,
+-- reappearance of the same lesson, etc.
+CREATE TABLE IF NOT EXISTS applied_outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at REAL NOT NULL,
+    proposal_id INTEGER NOT NULL,
+    target_kind TEXT NOT NULL,
+    target_path TEXT NOT NULL,
+    diff TEXT NOT NULL,
+    applied_at REAL NOT NULL,
+    outcome TEXT DEFAULT 'unknown',   -- 'unknown' | 'helped' | 'neutral' | 'reverted' | 'recorrected'
+    outcome_detected_at REAL,
+    outcome_evidence TEXT,
+    FOREIGN KEY (proposal_id) REFERENCES proposals(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status);
 CREATE INDEX IF NOT EXISTS idx_proposals_created ON proposals(created_at);
 CREATE INDEX IF NOT EXISTS idx_feedback_proposal ON thomas_feedback(proposal_id);
 CREATE INDEX IF NOT EXISTS idx_lessons_digest ON lessons_learned(sent_in_digest_at);
+CREATE INDEX IF NOT EXISTS idx_neg_patterns_used ON negative_patterns(used_in_prompt_at);
+CREATE INDEX IF NOT EXISTS idx_outcomes_target ON applied_outcomes(target_path);
+CREATE INDEX IF NOT EXISTS idx_outcomes_outcome ON applied_outcomes(outcome);
 """
 
 
@@ -141,7 +177,10 @@ def add_judge_verdict(proposal_id, judge_model, verdict, score, reasoning):
 
 
 def add_thomas_feedback(proposal_id, verdict, note=""):
-    """Record thomas's decision. Computes whether it overrides the judge."""
+    """Record thomas's decision. Computes whether it overrides the judge.
+    On reject/override, also writes a negative_pattern so the proposer
+    can avoid repeating the same class of mistake.
+    """
     with conn() as c:
         judge = c.execute(
             "SELECT verdict FROM judge_verdicts WHERE proposal_id = ? ORDER BY id DESC LIMIT 1",
@@ -158,6 +197,26 @@ def add_thomas_feedback(proposal_id, verdict, note=""):
         # Update proposal status
         new_status = "merged" if verdict == "approve" else "overridden" if overrides else "rejected"
         c.execute("UPDATE proposals SET status = ? WHERE id = ?", (new_status, proposal_id))
+
+        # On reject/override, capture a negative pattern. Skip 'approve'.
+        if verdict in ("reject", "modify") or overrides:
+            proposal = c.execute(
+                "SELECT target_kind, target_path FROM proposals WHERE id = ?",
+                (proposal_id,),
+            ).fetchone()
+            reason = (note or "").strip() or (
+                "overridden judge" if overrides else "rejected"
+            )
+            c.execute(
+                """INSERT INTO negative_patterns
+                   (created_at, proposal_id, target_kind, target_path,
+                    reason, was_overrides_judge)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (time.time(), proposal_id,
+                 proposal["target_kind"] if proposal else "unknown",
+                 proposal["target_path"] if proposal else None,
+                 reason, overrides),
+            )
 
 
 def add_lesson(category, content, source=None):
@@ -236,3 +295,83 @@ def mark_session_mined(session_id, proposals=0):
             "INSERT OR REPLACE INTO sessions_mined (session_id, mined_at, proposals_generated) VALUES (?, ?, ?)",
             (session_id, time.time(), proposals),
         )
+
+
+# --- negative patterns (avoid-list for the proposer) ---
+
+def recent_negative_patterns(limit: int = 10, min_age_seconds: int = 0) -> list:
+    """Return the most recent negative patterns. The proposer injects
+    these into its system prompt so it avoids repeating the same class
+    of mistake. We skip patterns that were *just* used in a prompt to
+    keep the set fresh — caller should call mark_neg_patterns_used()
+    after injecting.
+    """
+    with conn() as c:
+        cutoff = time.time() - min_age_seconds
+        return [dict(r) for r in c.execute(
+            """SELECT * FROM negative_patterns
+               WHERE created_at < ?
+               ORDER BY created_at DESC LIMIT ?""",
+            (cutoff, limit),
+        ).fetchall()]
+
+
+def mark_neg_patterns_used(ids: list):
+    with conn() as c:
+        c.executemany(
+            "UPDATE negative_patterns SET used_in_prompt_at = ? WHERE id = ?",
+            [(time.time(), i) for i in ids],
+        )
+
+
+# --- applied outcomes (did the change actually help?) ---
+
+def record_applied_outcome(proposal_id: int, target_kind: str,
+                           target_path: str, diff: str) -> int | None:
+    """Called by apply.py after a successful write. Returns the row id."""
+    with conn() as c:
+        cur = c.execute(
+            """INSERT INTO applied_outcomes
+               (created_at, proposal_id, target_kind, target_path,
+                diff, applied_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (time.time(), proposal_id, target_kind, target_path,
+             diff, time.time()),
+        )
+        return cur.lastrowid
+
+
+def unknown_outcomes(limit: int = 50) -> list:
+    """Applied changes whose outcome hasn't been graded yet."""
+    with conn() as c:
+        return [dict(r) for r in c.execute(
+            """SELECT * FROM applied_outcomes
+               WHERE outcome = 'unknown'
+               ORDER BY applied_at ASC LIMIT ?""",
+            (limit,),
+        ).fetchall()]
+
+
+def set_outcome(outcome_id: int, outcome: str, evidence: str):
+    """outcome in: 'helped' | 'neutral' | 'reverted' | 'recorrected'"""
+    assert outcome in ("helped", "neutral", "reverted", "recorrected"), \
+        f"bad outcome: {outcome}"
+    with conn() as c:
+        c.execute(
+            """UPDATE applied_outcomes
+               SET outcome = ?, outcome_detected_at = ?, outcome_evidence = ?
+               WHERE id = ?""",
+            (outcome, time.time(), evidence, outcome_id),
+        )
+
+
+def outcome_stats() -> dict:
+    """For self_improve / digest: counts of each outcome class."""
+    with conn() as c:
+        rows = c.execute(
+            """SELECT outcome, COUNT(*) AS n
+               FROM applied_outcomes
+               WHERE outcome != 'unknown'
+               GROUP BY outcome"""
+        ).fetchall()
+    return {r["outcome"]: r["n"] for r in rows}

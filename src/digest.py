@@ -14,7 +14,7 @@ from pathlib import Path
 
 from db import (
     unsent_lessons, mark_lessons_sent, pending_proposals,
-    override_stats, latest_rubric
+    override_stats, latest_rubric, outcome_stats,
 )
 
 
@@ -111,6 +111,31 @@ def build_weekly_digest() -> str:
 
     if rubric:
         lines.append(f"📜 *Active rubric*: v{rubric['version']}")
+    lines.append("")
+
+    # Outcome health: second signal — did the changes themselves help?
+    # Defaulting to 'neutral' after 7 days means this takes a few weeks
+    # to populate. Once we have ~10 graded outcomes, the ratio becomes
+    # a real drift detector.
+    out_stats = outcome_stats()
+    total_graded = sum(out_stats.values())
+    if total_graded > 0:
+        helped = out_stats.get("helped", 0)
+        neutral = out_stats.get("neutral", 0)
+        reverted = out_stats.get("reverted", 0)
+        recor = out_stats.get("recorrected", 0)
+        positive = helped
+        negative = reverted + recor
+        lines.append(
+            f"🧪 *Change outcomes*: {total_graded} graded — "
+            f"✅{helped} helped · ➖{neutral} neutral · "
+            f"❌{reverted} reverted · 🔧{recor} recor"
+        )
+        if positive + negative > 0:
+            ratio = positive / (positive + negative)
+            lines.append(f"   help ratio: {ratio*100:.0f}% ({positive}/{positive+negative})")
+    else:
+        lines.append("🧪 *Change outcomes*: no graded changes yet (need 7+ days)")
     lines.append("")
 
     # Lessons

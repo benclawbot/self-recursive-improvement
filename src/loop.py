@@ -25,6 +25,7 @@ import propose
 import judge
 import apply
 import self_improve
+import grade_outcomes
 
 
 def cycle(skip_apply: bool = False, judge_only: bool = False,
@@ -58,6 +59,18 @@ def cycle(skip_apply: bool = False, judge_only: bool = False,
         n = apply.run()
         result["apply"] = {"applied": n}
         result["steps"].append("apply")
+
+    # Step 3.5: grade prior outcomes. Cheap (no LLM) so we run it
+    # every cycle. 'unknown' rows that aren't old enough get skipped.
+    print("=" * 60)
+    print("STEP 3.5: GRADE OUTCOMES")
+    print("=" * 60)
+    if not dry_run:
+        g = grade_outcomes.run(limit=20)
+    else:
+        g = grade_outcomes.run(limit=20, dry_run=True)
+    result["grade"] = g
+    result["steps"].append("grade")
 
     # Self-improve runs on a separate schedule (weekly) — skip in normal cycle
     # to keep individual loops fast.

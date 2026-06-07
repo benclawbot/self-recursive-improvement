@@ -94,6 +94,25 @@ def run(max_sessions: int = 3, dry_run: bool = False) -> dict:
     system = PROPOSER_PROMPT.read_text()
     system += f"\n\n## Active judge rubric (version {db.latest_rubric()['version']})\n\n{RUBRIC_CURRENT}\n"
 
+    # Inject the avoid-list: recent rejections/overrides so the proposer
+    # doesn't re-propose the same class of bad idea. The cron agent that
+    # consumes our prompt is non-interactive, so we have to bake this in
+    # at construction time.
+    neg_patterns = db.recent_negative_patterns(limit=10)
+    if neg_patterns:
+        system += "\n\n## Patterns to AVOID (from recent thomas rejections)\n\n"
+        system += (
+            "Thomas has recently rejected the following kinds of proposals. "
+            "Do NOT propose changes in the same shape unless you have strong "
+            "new evidence that the situation has changed. A 2-line list:\n\n"
+        )
+        for np in neg_patterns:
+            tag = "[override]" if np["was_overrides_judge"] else "[reject]"
+            path = np.get("target_path") or "(no path)"
+            reason = (np.get("reason") or "").strip()[:300]
+            system += f"- {tag} {np['target_kind']} {path}: {reason}\n"
+        db.mark_neg_patterns_used([np["id"] for np in neg_patterns])
+
     sessions = miner.unmined_sessions(limit=max_sessions)
     if not sessions:
         print("[propose] No unmined sessions.")

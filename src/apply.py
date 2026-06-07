@@ -152,6 +152,18 @@ def apply_proposal(p: dict) -> bool:
     _log(f"    backup: {backup}")
     ok = _apply_unified_diff(target_p, p["diff"])
     if ok:
+        # Record the application so we can later grade whether it helped.
+        # The grading happens in grade_outcomes() — kept out of the hot path
+        # because it requires re-reading files and may call m3.
+        try:
+            db.record_applied_outcome(
+                proposal_id=p["id"],
+                target_kind=kind,
+                target_path=target,
+                diff=p["diff"],
+            )
+        except Exception as e:
+            _log(f"    ! failed to record outcome row: {e}")
         _log(f"    ✓ applied")
     else:
         _log(f"    ✗ apply failed, restoring from backup")
