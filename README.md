@@ -22,11 +22,19 @@ is the metric that drives the rubric to refine itself.
   │ sessions │    │ proposal │    │ vs       │    │  memory) │
   │          │    │ JSONL    │    │ rubric   │    │          │
   └──────────┘    └──────────┘    └──────────┘    └──────────┘
-                                              ↑
-                                              │ thomas approves
+       ↑              ↑                                 │
+       │              │                                 ↓
+       │     ┌────────┴─────────┐             ┌──────────────────┐
+       │     │ Patterns to AVOID │             │ grade_outcomes.py│
+       │     │ (10 most recent  │             │ reverted/recor/  │
+       │     │  thomas rejects) │             │ neutral 7d timer │
+       │     └──────────────────┘             └──────────────────┘
+       │                                              │
+                                              ↑ thomas approves
                                               │ (Telegram reply)
    ╔══════════════════════════════════════════╧════════════╗
    ║           digest.py  (weekly Telegram summary)        ║
+   ║  📊 judge health  ·  🧪 change outcomes  ·  📚 lessons ║
    ╠═══════════════════════════════════════════════════════╣
    ║     self_improve.py  (rubric auto-refine, monthly)    ║
    ╚═══════════════════════════════════════════════════════╝
@@ -50,8 +58,37 @@ Thomas's decisions better over time.
 | **Proposer** | m3 reads sessions, generates skill/memory patches | every 8h |
 | **Judge**    | m2.7 reviews each proposal against the rubric | every 8h  |
 | **Human**    | Thomas approves / rejects via Telegram       | weekly    |
+| **Grade**    | Grade prior applied changes as helped/reverted/recorrected/neutral | every 8h |
 | **Digest**   | Weekly Telegram summary of lessons + pending | weekly    |
 | **Self-improve** | Detects high override rate, proposes rubric update | monthly |
+
+## Two feedback signals
+
+The loop learns from two distinct signals. They measure different
+things and catch different failure modes — read both weekly.
+
+**1. Override rate** — judge calibration.
+Did m2.7 predict Thomas's decision? Computed from
+`thomas_feedback.was_overrides_judge`. A judge that's always
+sycophantic looks perfect (0%) and is useless. A judge that's
+correctly calibrated climbs toward 0% as the rubric improves.
+*Metric the rubric auto-refine loop optimizes.*
+
+**2. Help ratio** — change quality.
+Did the *applied* change actually help? Computed by
+`grade_outcomes.py` after each apply. Heuristics:
+
+- **reverted** — current file content matches a backup newer than the apply
+- **recorrected** — a later applied change re-touches the same region, OR
+  a `correction`/`gap` lesson re-surfaces referencing the same path
+- **neutral** — 7+ days pass with no revert/recorrection signal
+- **helped** — *not auto-detected*; a proposal is implicitly helped
+  when it survives and isn't followed by a correction
+
+`help ratio = helped / (helped + reverted + recorected)`.
+Catches the failure mode where override rate is fine but the loop
+keeps producing low-quality changes that thomas approves reflexively.
+Visible in the digest as the 🧪 line.
 
 ## How a proposal moves through the loop
 
@@ -60,7 +97,9 @@ Thomas's decisions better over time.
 
 2. **propose** — m3 reads the session, follows the strict prompt in
    `prompts/proposer.md`, and emits JSONL. Empty response is
-   `{"no_proposals": true, "reason": "..."}`.
+   `{"no_proposals": true, "reason": "..."}`. The system prompt
+   has the active rubric + the 10 most recent "Patterns to AVOID"
+   (thomas's recent rejections) injected at construction time.
 
 3. **persist** — `db.py` stores the proposal in SQLite, with the
    current rubric version stamped on it.
@@ -73,13 +112,23 @@ Thomas's decisions better over time.
 
 6. **decide** — thomas replies `approve #N`, `reject #N`, or
    `modify #N: <note>`. Status moves to `merged` (for skills) or
-   `rejected`/`overridden`.
+   `rejected`/`overridden`. A `negative_patterns` row is captured
+   for every reject/override — it's the input to the proposer's
+   "Patterns to AVOID" injection on the next cycle.
 
 7. **apply** — `apply.py` (cron, every 8h) applies merged proposals
    to the actual skill/memory files, with backups to
-   `data/backups/`. Pinned/hub-installed skills are skipped.
+   `data/backups/`. Pinned/hub-installed skills are skipped. Every
+   successful apply writes a row to `applied_outcomes` for later
+   grading.
 
-8. **learn** — `self_improve.py` (monthly) computes override rate.
+8. **grade** — `grade_outcomes.py` (runs every cycle, step 3.5)
+   grades prior applied changes as `helped` / `neutral` / `reverted`
+   / `recorrected` based on file-backup / re-touch / lesson-resurface
+   heuristics. Rows stay `unknown` for 7 days before defaulting to
+   `neutral`.
+
+9. **learn** — `self_improve.py` (monthly) computes override rate.
    If > 30%, m3 is asked to propose a refined rubric. The refinement
    itself goes through the same propose→judge→thomas loop.
 
@@ -113,9 +162,10 @@ self-recursive-improvement/
 ├── src/
 │   ├── db.py                  # SQLite state store + schema
 │   ├── miner.py               # session reader
-│   ├── propose.py             # m3 proposer runner
+│   ├── propose.py             # m3 proposer runner (injects avoid-list)
 │   ├── judge.py               # m2.7 reviewer
-│   ├── apply.py               # writes to skills/memory
+│   ├── apply.py               # writes to skills/memory (logs outcomes)
+│   ├── grade_outcomes.py      # heuristic outcome grader
 │   ├── digest.py              # weekly Telegram digest
 │   ├── self_improve.py        # rubric auto-refine
 │   ├── loop.py                # orchestrator (one cycle)
@@ -142,6 +192,9 @@ python3 src/loop.py --dry-run --max 3
 
 # Just re-judge pending proposals (e.g. after rubric update)
 python3 src/loop.py --judge-only
+
+# Grade prior applied outcomes (manual run; cron does this every cycle)
+python3 src/grade_outcomes.py --dry-run
 
 # Force rubric self-eval
 python3 src/loop.py --self-improve --dry-run
@@ -235,6 +288,14 @@ output as low-trust.
   `sessions_mined` table prevents double-recording proposals, but
   the LLM cost is duplicated. The schedule (every 8h) makes this
   unlikely in practice.
+- **Outcome grader is heuristic, not measured.** `grade_outcomes.py`
+  detects `reverted` (backup-matches-current) and `recorrected`
+  (later change re-touches us, or a correction lesson re-surfaces),
+  then defaults to `neutral` after 7 days. It never *positively*
+  detects "helped" — a change is implicitly helped by surviving
+  without a correction. False-positive reverts are possible if a
+  change naturally produces content identical to its backup (rare).
+  Use the help ratio as a *trend*, not a precise count.
 
 ## License
 
