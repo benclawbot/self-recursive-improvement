@@ -69,23 +69,35 @@ def _send_telegram(chat_id: str, text: str) -> bool:
 
 
 def get_target_chat() -> str:
-    """Resolve Thomas's home chat id from hermes config."""
+    """Resolve Thomas's home chat id from env, then hermes config.
+
+    Resolution order:
+      1. TELEGRAM_HOME_CHANNEL env var (set in ~/.hermes/.env)
+      2. home_channels[0] in config.yaml if it starts with "telegram:"
+      3. platforms.telegram.home_chat_id in config.yaml
+    """
+    # 1. env var — the canonical home channel location
+    env_chat = os.environ.get("TELEGRAM_HOME_CHANNEL", "").strip()
+    if env_chat:
+        return env_chat
+    # 2. config.yaml home_channels
     cfg = HERMES_HOME / "config.yaml"
-    if not cfg.exists():
-        return ""
-    try:
-        import yaml
-        with open(cfg) as f:
-            data = yaml.safe_load(f) or {}
-        for ch in data.get("home_channels", []) or []:
-            if ch.startswith("telegram:"):
-                return ch.split(":", 1)[1]
-        # Try platforms
-        plats = data.get("platforms", {})
-        tg = plats.get("telegram", {})
-        return tg.get("home_chat_id", "")
-    except Exception:
-        return ""
+    if cfg.exists():
+        try:
+            import yaml
+            with open(cfg) as f:
+                data = yaml.safe_load(f) or {}
+            for ch in data.get("home_channels", []) or []:
+                if isinstance(ch, str) and ch.startswith("telegram:"):
+                    return ch.split(":", 1)[1]
+            plats = data.get("platforms", {})
+            tg = plats.get("telegram", {})
+            chat = tg.get("home_chat_id", "")
+            if chat:
+                return chat
+        except Exception:
+            pass
+    return ""
 
 
 def format_lesson(l: dict) -> str:

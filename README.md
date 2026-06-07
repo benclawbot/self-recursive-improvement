@@ -110,6 +110,16 @@ the loop's own cron jobs (sri-propose, sri-judge, sri-apply) go
 silent, fail, or run too long. Each incident is synthesized into a
 session the proposer can mine on the next cycle.
 
+**7. Per-cycle branch isolation (Phase 5).** Every `apply.py` cycle
+snapshots the target files to `data/branches/<cycle_id>/` *before*
+writing. If a change turns out to be bad, `python3 src/apply.py
+--revert <cycle_id>` restores the files and marks all linked
+`applied_outcomes` rows as `reverted` with `cycle_id` and evidence.
+This is the loop's blast-radius boundary. Targets (`~/.hermes/skills/`,
+`~/.hermes/memories/`) are not git repos, so the branches live as
+filesystem snapshots — bounded by `branch.prune_old_branches(keep=20)`
+called from the weekly digest.
+
 ## How a proposal moves through the loop
 
 1. **mine** — `miner.py` scans `~/.hermes/sessions/*.jsonl`, skips
@@ -152,6 +162,37 @@ session the proposer can mine on the next cycle.
    If > 30%, m3 is asked to propose a refined rubric. The refinement
    itself goes through the same propose→judge→thomas loop.
 
+10. **digest** — `digest.py` (weekly, Mondays 09:00) builds a single
+    Telegram message and sends it to Thomas's home channel. It
+    reports on every signal above (judge health, cycle health,
+    change outcomes, lessons, pending proposals, pipeline errors,
+    self-incidents, memory hygiene, branch count) and marks all
+    lessons as `sent_in_digest_at=now()` so the next run is quiet.
+
+## What the weekly digest contains
+
+Sent to `TELEGRAM_HOME_CHANNEL` every Monday 09:00 by the
+`sri-weekly-digest` cron job. Sections in order:
+
+| Section | What it tells you |
+|---------|-------------------|
+| 📊 Judge health | Total proposals judged + override rate. The loop's only calibration signal. |
+| 📜 Active rubric | Current `rubric_versions.version` (bumps after rubric self-eval). |
+| ⏱ Cycle health | Wall time median/p95/min/max for the last 10 cycles + token cost. Catches perf drift weeks early. |
+| 🧪 Change outcomes | Graded applied changes (helped / neutral / reverted / recor) + help ratio. Empty for the first 7 days. |
+| 📚 Lessons this week | Unsorted list of `lessons_learned` rows (patterns, gaps, lessons, corrections). Top 15 + a "more" line. |
+| ⏳ Pending your review | Proposals still waiting for Thomas's decision, with judge verdict + rationale. |
+| ⚠️ Pipeline errors (7d) | Count of propose / judge / apply failures in the last week. |
+| 🪞 Self-incidents (7d) | Counts of incidents the loop detected in its own cron jobs (silent jobs, wall-time overruns, etc.) + most recent. |
+| 🧹 Memory hygiene | Stale `lessons_learned` candidates (source gone, unsent 30d+, etc.) — never auto-deleted. |
+| 🌿 Branches | Active cycle snapshots + how many were pruned this run. |
+| Reply hint | `_Reply with approve #N / reject #N / modify #N: <note>..._` |
+
+The message is sent via the Telegram Bot API in 3900-char chunks
+with `MarkdownV2` and a plain-text fallback on parse error. Lessons
+are marked `sent_in_digest_at` after a successful send so the same
+content isn't re-shipped.
+
 ## What "approved" actually does
 
 | target_kind     | On approve                          |
@@ -187,18 +228,24 @@ self-recursive-improvement/
 │   ├── propose.py             # m3 proposer runner (injects avoid-list)
 │   ├── judge.py               # m2.7 reviewer
 │   ├── apply.py               # writes to skills/memory (logs outcomes)
+│   │                          #   --branches  list cycle snapshots
+│   │                          #   --revert <id>  restore a cycle's files
+│   │                          #   --prune-branches KEEP  drop old branches
+│   ├── branch.py              # Phase 5: per-cycle snapshot/revert
 │   ├── grade_outcomes.py      # heuristic outcome grader
 │   ├── memory_hygiene.py      # Phase 2: stale lesson detection
 │   ├── incident_watcher.py    # Phase 4: self-referential cron health
 │   ├── digest.py              # weekly Telegram digest
 │   ├── self_improve.py        # rubric auto-refine
 │   ├── loop.py                # orchestrator (one cycle)
+│   ├── checkpoint.py          # judge calibration state (load/save)
 │   └── rubric.py              # versioned judge rubric
 ├── prompts/
 │   └── proposer.md            # m3 system prompt
 ├── tests/
-│   └── test_pipeline.py       # smoke tests
-├── data/                      # loop.db, backups/
+│   ├── test_pipeline.py       # smoke tests
+│   └── test_branch_full.py    # Phase 5 + apply + digest integration (47 checks)
+├── data/                      # loop.db, branches/, backups/
 └── logs/
 ```
 
@@ -207,6 +254,9 @@ self-recursive-improvement/
 ```bash
 # Smoke test the deterministic plumbing
 python3 tests/test_pipeline.py
+
+# Full Phase 5 + apply + digest integration (47 checks)
+python3 tests/test_branch_full.py
 
 # Run one full cycle (propose + judge, no apply)
 python3 src/loop.py --skip-apply --max 3
@@ -220,27 +270,48 @@ python3 src/loop.py --judge-only
 # Grade prior applied outcomes (manual run; cron does this every cycle)
 python3 src/grade_outcomes.py --dry-run
 
+# Branch management (Phase 5)
+python3 src/apply.py --branches          # list all cycle snapshots
+python3 src/apply.py --revert <cycle_id> # restore files + mark reverted
+python3 src/apply.py --prune-branches 10 # drop oldest 10 (safe ones only)
+
 # Force rubric self-eval
 python3 src/loop.py --self-improve --dry-run
+
+# Manually trigger the weekly digest (sends to Telegram)
+cd ~/self-recursive-improvement && source ~/.hermes/.env && python3 src/digest.py
 ```
 
 ## Environment
 
 - `MINIMAX_API_KEY` — required for m3/m2.7 calls
 - `TELEGRAM_BOT_TOKEN` — required for weekly digest delivery
-- The Telegram chat id is auto-resolved from `~/.hermes/config.yaml`
-  (`home_channels.telegram`).
+- `TELEGRAM_HOME_CHANNEL` — Thomas's Telegram chat id. The digest
+  resolver checks this env var first, then falls back to
+  `~/.hermes/config.yaml` (`home_channels.telegram`).
 
-## Cron schedule (recommended)
+For cron jobs running in the user shell, `source ~/.hermes/.env` loads
+both tokens. The `sri-weekly-digest` cron job does this automatically
+via its prompt.
 
+## Cron schedule (active)
+
+The loop runs as four jobs in `~/.hermes/cron/jobs.json`:
+
+| Job | Schedule | Mode | Purpose |
+|-----|----------|------|---------|
+| `sri-propose`        | `0 */8 * * *`   | no_agent script | Mine sessions + generate proposals |
+| `sri-judge`          | `5 */8 * * *`   | no_agent script | M2.7 reviews pending proposals |
+| `sri-apply-merged`   | `0 4 * * *`     | agent           | Merge approved proposals to skills/memory |
+| `sri-weekly-digest`  | `0 9 * * 1`     | agent           | Send weekly Telegram digest (see below) |
+| `sri-rubric-self-eval` | `0 10 1 * *` | agent           | Monthly rubric refinement |
+| `sri-phase5-kickoff` | `once 2026-06-14 10:00` | agent (skill: plan) | Build the benchmark harness |
+
+Manual cron entries (if running outside Hermes):
 ```cron
-# Propose + judge cycle (3x daily)
 0 */8 * * *   cd ~/self-recursive-improvement && python3 src/loop.py --skip-apply >> logs/cron.log 2>&1
-# Apply merged proposals (daily at 4am)
 0 4 * * *    cd ~/self-recursive-improvement && python3 src/apply.py >> logs/cron.log 2>&1
-# Weekly digest (Mondays 9am)
-0 9 * * 1    cd ~/self-recursive-improvement && python3 src/digest.py >> logs/cron.log 2>&1
-# Monthly rubric self-eval (1st of month)
+0 9 * * 1    cd ~/self-recursive-improvement && source ~/.hermes/.env && python3 src/digest.py >> logs/cron.log 2>&1
 0 10 1 * *   cd ~/self-recursive-improvement && python3 src/self_improve.py >> logs/cron.log 2>&1
 ```
 
