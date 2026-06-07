@@ -111,6 +111,7 @@ CREATE TABLE IF NOT EXISTS applied_outcomes (
     outcome TEXT DEFAULT 'unknown',   -- 'unknown' | 'helped' | 'neutral' | 'reverted' | 'recorrected'
     outcome_detected_at REAL,
     outcome_evidence TEXT,
+    cycle_id TEXT,                    -- branch.py cycle that produced this change
     FOREIGN KEY (proposal_id) REFERENCES proposals(id)
 );
 
@@ -160,6 +161,7 @@ CREATE INDEX IF NOT EXISTS idx_lessons_digest ON lessons_learned(sent_in_digest_
 CREATE INDEX IF NOT EXISTS idx_neg_patterns_used ON negative_patterns(used_in_prompt_at);
 CREATE INDEX IF NOT EXISTS idx_outcomes_target ON applied_outcomes(target_path);
 CREATE INDEX IF NOT EXISTS idx_outcomes_outcome ON applied_outcomes(outcome);
+CREATE INDEX IF NOT EXISTS idx_outcomes_cycle ON applied_outcomes(cycle_id);
 CREATE INDEX IF NOT EXISTS idx_cycle_stats_started ON cycle_stats(started_at);
 CREATE INDEX IF NOT EXISTS idx_self_incidents_detected ON self_incidents(detected_at);
 CREATE INDEX IF NOT EXISTS idx_stale_memory_lesson ON stale_memory_candidates(lesson_id);
@@ -178,6 +180,8 @@ _MIGRATIONS = [
     "ALTER TABLE judge_verdicts ADD COLUMN judge_output_tokens INTEGER",
     # Phase 4: self-referential cron failure tracking
     "ALTER TABLE judge_verdicts ADD COLUMN judge_error TEXT",
+    # Phase 5: branch isolation — link every applied change to its cycle
+    "ALTER TABLE applied_outcomes ADD COLUMN cycle_id TEXT",
 ]
 
 
@@ -193,8 +197,11 @@ def _migrate(c):
 def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with conn() as c:
-        c.executescript(SCHEMA)
+        # Run column-add migrations FIRST so the schema's CREATE TABLE
+        # (which references newer columns) and the new indexes (which
+        # reference newer columns) don't trip on pre-migration tables.
         _migrate(c)
+        c.executescript(SCHEMA)
         # Seed rubric v1 if empty
         cur = c.execute("SELECT COUNT(*) FROM rubric_versions")
         if cur.fetchone()[0] == 0:

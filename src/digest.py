@@ -20,6 +20,7 @@ from db import (
     recent_pipeline_errors,
     recent_incidents,
 )
+import branch
 
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -230,6 +231,20 @@ def build_weekly_digest() -> str:
             lines.append(f"   • lesson #{s['lesson_id']} ({s['reason']}): {preview}")
     else:
         lines.append("🧹 *Memory hygiene*: all memory entries fresh")
+    lines.append("")
+
+    # Phase 5: branch housekeeping — keep disk usage bounded
+    n_pruned = branch.prune_old_branches(keep=20)
+    active_branches = branch.list_branches()
+    n_active = len(active_branches)
+    if n_active > 0:
+        n_revertable = sum(1 for b in active_branches if b.get("applied_rows", 0) > 0)
+        lines.append(f"🌿 *Branches*: {n_active} active, {n_revertable} with applied changes "
+                     f"(revertable via `python src/apply.py --revert <cycle_id>`)")
+        if n_pruned > 0:
+            lines.append(f"   pruned {n_pruned} old branch(es) this run")
+    else:
+        lines.append("🌿 *Branches*: no active branches")
     lines.append("")
 
     lines.append("_Reply with `approve #N` / `reject #N` / `modify #N: <note>` to act on proposals._")

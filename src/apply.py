@@ -15,12 +15,16 @@ Safety:
 import os
 import json
 import shutil
+import sys
 import time
 import argparse
 import re
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent))
+
 import db
+import branch
 
 
 HERMES_SKILLS = Path.home() / ".hermes" / "skills"
@@ -124,8 +128,12 @@ def _apply_patch(target: Path, diff: str) -> bool:
         pfile.unlink(missing_ok=True)
 
 
-def apply_proposal(p: dict) -> bool:
-    """Apply a single approved proposal. Returns True on success."""
+def apply_proposal(p: dict, cycle_id: str | None = None) -> bool:
+    """Apply a single approved proposal. Returns True on success.
+
+    If cycle_id is provided, the applied_outcomes row is linked to that
+    branch so `python apply.py --revert <cycle_id>` can roll it back.
+    """
     kind = p["target_kind"]
     target = p.get("target_path", "")
 
@@ -156,12 +164,14 @@ def apply_proposal(p: dict) -> bool:
         # The grading happens in grade_outcomes() — kept out of the hot path
         # because it requires re-reading files and may call m3.
         try:
-            db.record_applied_outcome(
+            outcome_id = db.record_applied_outcome(
                 proposal_id=p["id"],
                 target_kind=kind,
                 target_path=target,
                 diff=p["diff"],
             )
+            if cycle_id and outcome_id is not None:
+                branch.attach_to_outcome(outcome_id, cycle_id)
         except Exception as e:
             _log(f"    ! failed to record outcome row: {e}")
         _log(f"    ✓ applied")
@@ -185,8 +195,13 @@ def apply_proposal(p: dict) -> bool:
     return ok
 
 
-def run():
-    """Apply all merged proposals that haven't been applied yet."""
+def run() -> int:
+    """Apply all merged proposals that haven't been applied yet.
+
+    Per-cycle branch isolation: snapshots every target file to
+    data/branches/<cycle_id>/ before any write, so a single bad
+    change can be rolled back with `python src/apply.py --revert <id>`.
+    """
     with db.conn() as c:
         # We use 'merged' as the marker; track which we've applied via
         # the rationale field marker. Or — better — just idempotency check.
@@ -199,6 +214,11 @@ def run():
         return 0
 
     print(f"[apply] {len(rows)} merged proposal(s) to apply")
+
+    # Snapshot every distinct target before touching anything.
+    targets = sorted({r["target_path"] for r in rows if r["target_path"]})
+    cycle_id = branch.cycle_start(targets)
+
     applied = 0
     for row in rows:
         p = dict(row)
@@ -207,12 +227,38 @@ def run():
         marker_file = BACKUP_DIR / f"DONE_{marker_key.replace('/', '_')}"
         if marker_file.exists():
             continue
-        if apply_proposal(p):
+        if apply_proposal(p, cycle_id=cycle_id):
             marker_file.touch()
             applied += 1
+
+    if applied:
+        print(f"[apply] cycle {cycle_id} → {applied} applied")
+        print(f"[apply] to revert: python src/apply.py --revert {cycle_id}")
     return applied
 
 
+def main():
+    import argparse, json as _json
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--revert", metavar="CYCLE_ID",
+                    help="revert all changes from a previous cycle")
+    ap.add_argument("--branches", action="store_true",
+                    help="list all branches and their outcome counts")
+    ap.add_argument("--prune-branches", type=int, default=0, metavar="KEEP",
+                    help="prune branches with KEEP most recent kept (only safe ones)")
+    args = ap.parse_args()
+
+    if args.revert:
+        print(_json.dumps(branch.revert(args.revert), indent=2))
+    elif args.branches:
+        print(_json.dumps(branch.list_branches(), indent=2))
+    elif args.prune_branches:
+        n = branch.prune_old_branches(args.prune_branches)
+        print(f"pruned: {n}")
+    else:
+        n = run()
+        print(f"[apply] Done. {n} applied.")
+
+
 if __name__ == "__main__":
-    n = run()
-    print(f"[apply] Done. {n} applied.")
+    main()
