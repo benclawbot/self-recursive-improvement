@@ -20,6 +20,7 @@ from pathlib import Path
 
 import db
 import miner
+import incident_watcher
 from rubric import RUBRIC_CURRENT
 
 
@@ -28,7 +29,11 @@ PROPOSER_MODEL = "MiniMax-M3"  # The main model proposes
 API_URL = "https://api.minimax.io/v1/chat/completions"
 
 
-def _call_m3(system: str, user: str, max_tokens: int = 4000) -> str:
+def _call_m3(system: str, user: str, max_tokens: int = 4000) -> dict:
+    """Returns {'content': str, 'input_tokens': int|None, 'output_tokens': int|None, 'ms': int}.
+    Token counts come from the API response's `usage` field; missing/None
+    if the API doesn't return them (e.g. older models or stream mode).
+    """
     api_key = os.environ.get("MINIMAX_API_KEY")
     if not api_key:
         raise RuntimeError("MINIMAX_API_KEY not set")
@@ -49,9 +54,17 @@ def _call_m3(system: str, user: str, max_tokens: int = 4000) -> str:
         },
         method="POST",
     )
+    t0 = time.monotonic()
     with urllib.request.urlopen(req, timeout=30) as resp:
         data = json.loads(resp.read())
-    return data["choices"][0]["message"]["content"]
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    usage = data.get("usage") or {}
+    return {
+        "content": data["choices"][0]["message"]["content"],
+        "input_tokens": usage.get("prompt_tokens"),
+        "output_tokens": usage.get("completion_tokens"),
+        "ms": elapsed_ms,
+    }
 
 
 def _parse_proposals(raw: str) -> list:
@@ -113,6 +126,60 @@ def run(max_sessions: int = 3, dry_run: bool = False) -> dict:
             system += f"- {tag} {np['target_kind']} {path}: {reason}\n"
         db.mark_neg_patterns_used([np["id"] for np in neg_patterns])
 
+    # Phase 2: stale memory candidates. Tell the proposer what existing
+    # memory entries look stale — it can propose a removal (with
+    # explicit thomas approval) or a refresh with new evidence.
+    stale = db.list_stale_candidates(limit=10)
+    if stale:
+        system += "\n\n## Stale memory candidates (Phase 2)\n\n"
+        system += (
+            "The following memory entries look stale — either the source "
+            "session is gone or they haven't been surfaced in 30+ days. "
+            "If you have strong new evidence they're still correct, ignore. "
+            "Otherwise you may propose:\n"
+            "  - skill_patch / memory_add to refresh them with new evidence\n"
+            "  - a clearly-marked removal proposal (thomas will be asked)\n\n"
+        )
+        for s in stale:
+            content = (s.get("content") or "").strip()[:300]
+            system += f"- lesson #{s['lesson_id']} ({s['reason']}): {content}\n"
+
+    # Phase 3: pipeline gaps. Recent errors in the loop's own machinery
+    # (API timeouts, parse failures, apply failures) are captured as
+    # lessons. Surface them so the proposer can suggest fixes.
+    recent_gaps = db.recent_gap_lessons(days=7, limit=5)
+    if recent_gaps:
+        system += "\n\n## Pipeline gaps from last 7 days (Phase 3)\n\n"
+        system += (
+            "The loop's own machinery has been failing in these ways. "
+            "If you can identify a config or skill change that would "
+            "prevent this class of failure, propose it. Do NOT propose "
+            "changes to fix individual one-off errors.\n\n"
+        )
+        for g in recent_gaps:
+            content = (g.get("content") or "").strip()[:300]
+            system += f"- {content}\n"
+
+    # Phase 4: self-referential incident. If a self_incident row exists
+    # for the loop's own cron jobs, synthesize a "session" the proposer
+    # can mine. We use the sessions_mined table to dedup — once an
+    # incident is fed in, it's marked as 'incident_<id>' and skipped
+    # thereafter.
+    incident_session = incident_watcher.unmined_incident_as_session()
+    if incident_session:
+        synthetic_sid = f"incident_{incident_session['id']}"
+        # Mark as mined so we don't re-feed
+        db.mark_session_mined(synthetic_sid, proposals=0)
+        system += "\n\n## Self-referential incident (Phase 4)\n\n"
+        system += (
+            "A cron job for this very loop failed. The next propose cycle "
+            "should treat this as a session and propose a fix.\n\n"
+            f"### Incident #{incident_session['id']}: {incident_session['incident_type']}\n"
+            f"job: {incident_session['job_name']}\n"
+            f"detail: {incident_session['detail']}\n\n"
+            f"```\n{incident_session.get('last_log_lines', '')[-2000:]}\n```\n"
+        )
+
     sessions = miner.unmined_sessions(limit=max_sessions)
     if not sessions:
         print("[propose] No unmined sessions.")
@@ -127,12 +194,35 @@ def run(max_sessions: int = 3, dry_run: bool = False) -> dict:
         user_prompt = f"Analyze this session and emit proposals:\n\n{transcript}"
 
         try:
-            raw = _call_m3(system, user_prompt)
+            api_result = _call_m3(system, user_prompt)
         except Exception as e:
             print(f"    ! m3 call failed: {e}")
+            # Phase 3: feed the gap back into the loop. The next proposer
+            # cycle will see it via lessons_learned and can propose a fix
+            # (e.g. shorter transcripts, JSON-mode prompt, smaller context).
+            db.add_lesson(
+                category="gap",
+                content=f"propose API call failed in session {sid}: {type(e).__name__}: {str(e)[:200]}",
+                source=sid,
+            )
             continue
 
+        raw = api_result["content"]
         proposals = _parse_proposals(raw)
+
+        # Phase 3: parse failures. If 0 valid proposals AND we got raw
+        # text back, the model emitted something we couldn't parse —
+        # that's a real signal worth capturing.
+        if raw and raw.strip() and not proposals:
+            db.add_lesson(
+                category="gap",
+                content=(
+                    f"propose parser rejected all output from session {sid}. "
+                    f"First 200 chars: {raw[:200]}"
+                ),
+                source=sid,
+            )
+
         # Filter empty/no_proposals responses
         valid = []
         for p in proposals:
@@ -159,6 +249,9 @@ def run(max_sessions: int = 3, dry_run: bool = False) -> dict:
                     target_path=p.get("target_path"),
                     source_session_id=sid,
                     confidence=float(p.get("confidence", 0.5)),
+                    propose_ms=api_result["ms"],
+                    input_tokens=api_result["input_tokens"],
+                    output_tokens=api_result["output_tokens"],
                 )
                 # Record lesson if provided
                 if isinstance(p.get("lesson"), dict):

@@ -16,6 +16,7 @@ This is what the cron job calls. For ad-hoc runs:
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -26,13 +27,23 @@ import judge
 import apply
 import self_improve
 import grade_outcomes
+import memory_hygiene
+import incident_watcher
 
 
 def cycle(skip_apply: bool = False, judge_only: bool = False,
           propose_only: bool = False,
           dry_run: bool = False, max_sessions: int = 3) -> dict:
+    started_at = time.time()
     db.init_db()
-    result: dict = {"steps": []}
+    result: dict = {"steps": [], "_started_at": started_at}
+    counters = {
+        "proposals_mined": 0,
+        "proposals_generated": 0,
+        "judge_calls": 0,
+        "grade_graded": 0,
+        "grade_skipped": 0,
+    }
 
     if not judge_only:
         print("=" * 60)
@@ -40,9 +51,11 @@ def cycle(skip_apply: bool = False, judge_only: bool = False,
         print("=" * 60)
         r = propose.run(max_sessions=max_sessions, dry_run=dry_run)
         result["propose"] = r
+        counters["proposals_mined"] = r.get("mined", 0)
+        counters["proposals_generated"] = r.get("proposed", 0)
         result["steps"].append("propose")
         if propose_only:
-            return result
+            return _finalize(result, counters, started_at)
 
     print("=" * 60)
     print("STEP 2: JUDGE")
@@ -50,6 +63,7 @@ def cycle(skip_apply: bool = False, judge_only: bool = False,
     pending = db.pending_proposals()
     if pending:
         judge.judge_batch(pending)
+        counters["judge_calls"] = len(pending)
     else:
         print("  nothing to judge")
     result["judge"] = {"count": len(pending)}
@@ -72,11 +86,60 @@ def cycle(skip_apply: bool = False, judge_only: bool = False,
         g = grade_outcomes.run(limit=20)
     else:
         g = grade_outcomes.run(limit=20, dry_run=True)
+    counters["grade_graded"] = g.get("graded", 0)
+    counters["grade_skipped"] = g.get("skipped", 0)
     result["grade"] = g
     result["steps"].append("grade")
 
-    # Self-improve runs on a separate schedule (weekly) — skip in normal cycle
-    # to keep individual loops fast.
+    # Step 3.6: memory hygiene (Phase 2). Scan for stale lessons.
+    # Cheap (no LLM), runs every cycle. Surfaces candidates for
+    # thomas, never auto-deletes.
+    print("=" * 60)
+    print("STEP 3.6: MEMORY HYGIENE")
+    print("=" * 60)
+    if not dry_run:
+        m = memory_hygiene.run()
+    else:
+        m = memory_hygiene.run(dry_run=True)
+    result["memory_hygiene"] = m
+    result["steps"].append("memory_hygiene")
+
+    # Step 3.7: incident watcher (Phase 4). Cheap check for cron
+    # job failures / silent deaths / wall-time spikes. Writes
+    # self_incidents; proposer sees them next cycle.
+    print("=" * 60)
+    print("STEP 3.7: INCIDENT WATCHER")
+    print("=" * 60)
+    if not dry_run:
+        iw = incident_watcher.run()
+    else:
+        iw = incident_watcher.run(dry_run=True)
+    result["incident_watcher"] = iw
+    result["steps"].append("incident_watcher")
+
+    return _finalize(result, counters, started_at)
+
+
+def _finalize(result: dict, counters: dict, started_at: float) -> dict:
+    """Strip internal fields, record cycle_stats, return cleaned result."""
+    finished_at = time.time()
+    error = result.get("_error")
+    try:
+        if not result.get("_dry_run"):
+            db.record_cycle_stats(
+                started_at=started_at,
+                finished_at=finished_at,
+                steps={s: True for s in result.get("steps", [])},
+                **counters,
+                error=error,
+            )
+    except Exception as e:
+        # Last-resort: don't let the stats-recorder break the cycle
+        print(f"[loop] warning: failed to record cycle_stats: {e}")
+    # Strip internal fields before returning
+    result.pop("_started_at", None)
+    result.pop("_dry_run", None)
+    result.pop("_error", None)
     return result
 
 

@@ -15,6 +15,10 @@ from pathlib import Path
 from db import (
     unsent_lessons, mark_lessons_sent, pending_proposals,
     override_stats, latest_rubric, outcome_stats,
+    cycle_health_summary, recent_token_costs,
+    stale_memory_stats, list_stale_candidates,
+    recent_pipeline_errors,
+    recent_incidents,
 )
 
 
@@ -113,6 +117,28 @@ def build_weekly_digest() -> str:
         lines.append(f"📜 *Active rubric*: v{rubric['version']}")
     lines.append("")
 
+    # Phase 1: cycle health (wall time + token cost). Catches perf drift
+    # weeks before thomas would notice manually.
+    health = cycle_health_summary(limit=50)
+    if health.get("count", 0) > 0:
+        median_s = health["median_ms"] / 1000
+        p95_s = health["p95_ms"] / 1000
+        lines.append(f"⏱ *Cycle health* (last {health['count']}): "
+                     f"median {median_s:.1f}s, p95 {p95_s:.1f}s "
+                     f"(min {health['min_ms']/1000:.1f}s, max {health['max_ms']/1000:.1f}s)")
+        tokens = recent_token_costs(limit=50)
+        total_tokens = sum(tokens.values())
+        if total_tokens > 0:
+            # Rough cost: $3/1M input for m3, $15/1M output. Configurable
+            # via env in future; hardcoded as a ballpark.
+            in_cost = (tokens["propose_in"] + tokens["judge_in"]) / 1_000_000 * 1.5
+            out_cost = (tokens["propose_out"] + tokens["judge_out"]) / 1_000_000 * 8
+            total_cost = in_cost + out_cost
+            lines.append(f"   tokens: {total_tokens:,} (~${total_cost:.2f} est.)")
+    else:
+        lines.append("⏱ *Cycle health*: no cycles recorded yet (Phase 1 just shipped)")
+    lines.append("")
+
     # Outcome health: second signal — did the changes themselves help?
     # Defaulting to 'neutral' after 7 days means this takes a few weeks
     # to populate. Once we have ~10 graded outcomes, the ratio becomes
@@ -163,8 +189,49 @@ def build_weekly_digest() -> str:
 
     if not lessons and not pending:
         lines.append("_No new lessons or pending proposals this week. The loop is quiet — that's fine._")
-
     lines.append("")
+
+    # Phase 3: pipeline errors (the loop's own machinery failing)
+    errs = recent_pipeline_errors(days=7)
+    if errs["total"] > 0:
+        lines.append(f"⚠️ *Pipeline errors (7d)*: {errs['total']} — "
+                     f"propose: {errs['propose']}, judge: {errs['judge']}, "
+                     f"apply: {errs['apply']}")
+    else:
+        lines.append("✅ *Pipeline*: no errors in last 7d")
+    lines.append("")
+
+    # Phase 4: self-referential incidents
+    inc_stats = incident_stats(days=7)
+    total_inc = sum(inc_stats.values())
+    if total_inc > 0:
+        lines.append(f"🪞 *Self-incidents (7d)*: {total_inc} — "
+                     + " · ".join(f"{k}: {v}" for k, v in sorted(inc_stats.items())))
+        # Show the most recent one
+        recent_inc = recent_incidents(days=7, limit=1)
+        if recent_inc:
+            inc = recent_inc[0]
+            lines.append(f"   latest: {inc['job_name']} ({inc['incident_type']}) — {inc['detail'][:100]}")
+    else:
+        lines.append("🪞 *Self-incidents*: loop's own cron jobs all healthy (7d)")
+    lines.append("")
+
+    # Phase 2: memory hygiene
+    mem_stats = stale_memory_stats()
+    total_stale = sum(mem_stats.values())
+    if total_stale > 0:
+        lines.append(f"🧹 *Memory hygiene*: {total_stale} stale candidate(s) — "
+                     f"📂{mem_stats.get('source_gone', 0)} source gone · "
+                     f"⏳{mem_stats.get('unsent_30d', 0)} unsent 30d+")
+        # Show top 3 most recent
+        recent_stale = list_stale_candidates(limit=3)
+        for s in recent_stale:
+            preview = (s.get("content") or "").strip()[:120]
+            lines.append(f"   • lesson #{s['lesson_id']} ({s['reason']}): {preview}")
+    else:
+        lines.append("🧹 *Memory hygiene*: all memory entries fresh")
+    lines.append("")
+
     lines.append("_Reply with `approve #N` / `reject #N` / `modify #N: <note>` to act on proposals._")
     return "\n".join(lines)
 

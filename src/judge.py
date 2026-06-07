@@ -9,6 +9,7 @@ the rubric is calibrated (override rate = judge failure rate).
 
 import os
 import json
+import time
 import urllib.request
 import urllib.error
 from typing import Optional
@@ -20,10 +21,11 @@ from rubric import RUBRIC_CURRENT
 JUDGE_MODEL = "MiniMax-M2.7"
 API_URL = "https://api.minimax.io/v1/chat/completions"
 
-
-def _call_m27(prompt: str, max_tokens: int = 600) -> str:
-    """Direct call to the M2.7 endpoint. Bypasses Hermes so judge and
-    proposer never share a context window."""
+def _call_m27(prompt: str, max_tokens: int = 600) -> dict:
+    """Returns {'content': str, 'input_tokens': int|None, 'output_tokens': int|None, 'ms': int}.
+    Same shape as propose._call_m3 — kept consistent so cycle_stats
+    can sum both call sites uniformly.
+    """
     api_key = os.environ.get("MINIMAX_API_KEY")
     if not api_key:
         raise RuntimeError("MINIMAX_API_KEY not set")
@@ -44,9 +46,17 @@ def _call_m27(prompt: str, max_tokens: int = 600) -> str:
         },
         method="POST",
     )
+    t0 = time.monotonic()
     with urllib.request.urlopen(req, timeout=30) as resp:
         data = json.loads(resp.read())
-    return data["choices"][0]["message"]["content"]
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    usage = data.get("usage") or {}
+    return {
+        "content": data["choices"][0]["message"]["content"],
+        "input_tokens": usage.get("prompt_tokens"),
+        "output_tokens": usage.get("completion_tokens"),
+        "ms": elapsed_ms,
+    }
 
 
 def _parse_verdict(raw: str) -> dict:
@@ -109,7 +119,41 @@ diff:
 Respond with ONLY the JSON verdict, no preamble.
 """
 
-    raw = _call_m27(user_prompt)
+    try:
+        api_result = _call_m27(user_prompt)
+    except Exception as call_exc:
+        # Phase 3: write a gap lesson so the next proposer cycle sees
+        # the failure pattern. Capped at one lesson per call — avoid
+        # flooding if m2.7 is down for hours.
+        try:
+            db.add_lesson(
+                category="gap",
+                content=(
+                    f"judge API call failed for proposal {proposal['id']} "
+                    f"({proposal['target_kind']}): {type(call_exc).__name__}: "
+                    f"{str(call_exc)[:200]}"
+                ),
+                source=f"judge:{proposal['id']}",
+            )
+        except Exception:
+            pass  # Last-resort: don't let gap-feedback break judging
+        # For now: surface the error, return a reject verdict, store it
+        # with judge_error so digest can show "judge failures: N".
+        add_judge_verdict(
+            proposal_id=proposal["id"],
+            judge_model=JUDGE_MODEL,
+            verdict="reject",
+            score=0.0,
+            reasoning=f"[judge call failed: {call_exc}]",
+            error=str(call_exc)[:500],
+        )
+        return {
+            "verdict": "reject",
+            "score": 0.0,
+            "reasoning": f"[judge call failed: {call_exc}]",
+        }
+
+    raw = api_result["content"]
     verdict = _parse_verdict(raw)
 
     add_judge_verdict(
@@ -118,6 +162,9 @@ Respond with ONLY the JSON verdict, no preamble.
         verdict=verdict["verdict"],
         score=verdict["score"],
         reasoning=verdict["reasoning"],
+        judge_ms=api_result["ms"],
+        input_tokens=api_result["input_tokens"],
+        output_tokens=api_result["output_tokens"],
     )
     return verdict
 

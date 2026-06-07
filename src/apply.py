@@ -169,6 +169,19 @@ def apply_proposal(p: dict) -> bool:
         _log(f"    ✗ apply failed, restoring from backup")
         if backup.exists():
             shutil.copy2(backup, target_p)
+        # Phase 3: feed apply failures back. The proposer can then
+        # propose: "fix the diff format" or "add a diff validator".
+        try:
+            db.add_lesson(
+                category="gap",
+                content=(
+                    f"apply failed for proposal #{p['id']} "
+                    f"({kind} {target}). Diff was: {p['diff'][:200]}"
+                ),
+                source=f"apply:{p['id']}",
+            )
+        except Exception:
+            pass
     return ok
 
 

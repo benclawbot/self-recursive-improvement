@@ -90,6 +90,26 @@ Catches the failure mode where override rate is fine but the loop
 keeps producing low-quality changes that thomas approves reflexively.
 Visible in the digest as the 🧪 line.
 
+**3. Cost & latency (Phase 1).** Every cycle's wall time + token usage
+is recorded in `cycle_stats`. The digest shows median + p95 cycle
+duration and an estimated $cost. Catches perf drift weeks before
+thomas would notice.
+
+**4. Memory hygiene (Phase 2).** Every cycle, `memory_hygiene.py`
+flags lessons in `lessons_learned` that are either (a) older than 30
+days and have never been sent in a digest, or (b) reference a source
+session that's been deleted. Surfaced in the digest; never auto-deleted.
+
+**5. Pipeline gaps (Phase 3).** API timeouts, JSONL parse failures,
+and apply errors are written as `lessons_learned` with `category='gap'`.
+The next proposer cycle sees them in its system prompt and can
+propose a fix.
+
+**6. Self-incidents (Phase 4).** `incident_watcher.py` detects when
+the loop's own cron jobs (sri-propose, sri-judge, sri-apply) go
+silent, fail, or run too long. Each incident is synthesized into a
+session the proposer can mine on the next cycle.
+
 ## How a proposal moves through the loop
 
 1. **mine** — `miner.py` scans `~/.hermes/sessions/*.jsonl`, skips
@@ -159,6 +179,8 @@ skills (under `~/.hermes/skill-assets/`) are never auto-modified.
 ```
 self-recursive-improvement/
 ├── README.md                  # this file
+├── docs/
+│   └── roadmap-to-v2.md       # Phase 5+ spec
 ├── src/
 │   ├── db.py                  # SQLite state store + schema
 │   ├── miner.py               # session reader
@@ -166,6 +188,8 @@ self-recursive-improvement/
 │   ├── judge.py               # m2.7 reviewer
 │   ├── apply.py               # writes to skills/memory (logs outcomes)
 │   ├── grade_outcomes.py      # heuristic outcome grader
+│   ├── memory_hygiene.py      # Phase 2: stale lesson detection
+│   ├── incident_watcher.py    # Phase 4: self-referential cron health
 │   ├── digest.py              # weekly Telegram digest
 │   ├── self_improve.py        # rubric auto-refine
 │   ├── loop.py                # orchestrator (one cycle)
