@@ -29,6 +29,7 @@ import grade_outcomes
 
 
 def cycle(skip_apply: bool = False, judge_only: bool = False,
+          propose_only: bool = False,
           dry_run: bool = False, max_sessions: int = 3) -> dict:
     db.init_db()
     result: dict = {"steps": []}
@@ -40,6 +41,8 @@ def cycle(skip_apply: bool = False, judge_only: bool = False,
         r = propose.run(max_sessions=max_sessions, dry_run=dry_run)
         result["propose"] = r
         result["steps"].append("propose")
+        if propose_only:
+            return result
 
     print("=" * 60)
     print("STEP 2: JUDGE")
@@ -81,6 +84,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-apply", action="store_true")
     ap.add_argument("--judge-only", action="store_true")
+    ap.add_argument("--propose-only", action="store_true",
+                    help="run only the propose step; exit before judge")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--max", type=int, default=3, help="max sessions to mine")
     ap.add_argument("--self-improve", action="store_true",
@@ -88,6 +93,7 @@ if __name__ == "__main__":
     args = ap.parse_args()
 
     r = cycle(skip_apply=args.skip_apply, judge_only=args.judge_only,
+              propose_only=args.propose_only,
               dry_run=args.dry_run, max_sessions=args.max)
     print()
     print("Cycle result:", r)
