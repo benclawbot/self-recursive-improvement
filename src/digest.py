@@ -18,7 +18,7 @@ from db import (
     cycle_health_summary, recent_token_costs,
     stale_memory_stats, list_stale_candidates,
     recent_pipeline_errors,
-    recent_incidents,
+    recent_incidents, incident_stats,
 )
 import branch
 
