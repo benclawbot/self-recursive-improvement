@@ -31,7 +31,11 @@ CREATE TABLE IF NOT EXISTS proposals (
     confidence REAL DEFAULT 0.5,      -- proposer's self-score
     status TEXT DEFAULT 'pending',    -- pending | approved | rejected | overridden | merged
     rubric_version INTEGER,
-    merged_at REAL
+    merged_at REAL,
+    -- Phase 1: cost & latency tracking (also in _MIGRATIONS for existing DBs)
+    propose_ms INTEGER,
+    propose_input_tokens INTEGER,
+    propose_output_tokens INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS judge_verdicts (
@@ -43,6 +47,12 @@ CREATE TABLE IF NOT EXISTS judge_verdicts (
     verdict TEXT NOT NULL,            -- 'approve' | 'reject' | 'needs_work'
     score REAL,                       -- 0.0 - 1.0
     reasoning TEXT,
+    -- Phase 1: cost & latency tracking (also in _MIGRATIONS for existing DBs)
+    judge_ms INTEGER,
+    judge_input_tokens INTEGER,
+    judge_output_tokens INTEGER,
+    -- Phase 4: self-referential cron failure tracking
+    judge_error TEXT,
     FOREIGN KEY (proposal_id) REFERENCES proposals(id)
 );
 
@@ -111,7 +121,7 @@ CREATE TABLE IF NOT EXISTS applied_outcomes (
     outcome TEXT DEFAULT 'unknown',   -- 'unknown' | 'helped' | 'neutral' | 'reverted' | 'recorrected'
     outcome_detected_at REAL,
     outcome_evidence TEXT,
-    cycle_id TEXT,                    -- branch.py cycle that produced this change
+    cycle_id TEXT,                    -- Phase 5: branch isolation, links to data/branches/<cycle_id>/
     FOREIGN KEY (proposal_id) REFERENCES proposals(id)
 );
 
