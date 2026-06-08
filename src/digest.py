@@ -243,10 +243,14 @@ def _build_digest() -> str:
 
     parts = ["📋 SRI weekly digest\n"]
 
-    parts.append("▸ RULES PROPOSED (awaiting your decision):")
+    if pending:
+        parts.append("▸ RULES PROPOSED — tap a button below to decide:\n")
+    else:
+        parts.append("▸ RULES PROPOSED (awaiting your decision):")
     parts.append(format_pending(pending))
     if pending:
-        parts.append("  Reply: approve #N | reject #N | modify #N: <note>\n")
+        # No text reply prompt needed when buttons are attached
+        pass
     else:
         parts.append("")
 
@@ -282,17 +286,24 @@ def _build_digest() -> str:
     return "\n".join(parts)
 
 
-def _send_telegram(chat_id: str, text: str, token: str) -> bool:
-    """Send to Telegram. Chunks at 3900 chars (Telegram limit 4096)."""
+def _send_telegram(chat_id: str, text: str, token: str,
+                   reply_markup: dict | None = None) -> bool:
+    """Send to Telegram. Chunks at 3900 chars (Telegram limit 4096).
+    reply_markup is an inline_keyboard markup dict (Telegram API)."""
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     chunks = [text[i:i+3900] for i in range(0, len(text), 3900)] or [""]
     for chunk in chunks:
-        body = json.dumps({
+        body = {
             "chat_id": chat_id, "text": chunk,
             "disable_web_page_preview": True,
-        }).encode()
+        }
+        if reply_markup and chunk is chunks[0]:
+            # Attach the inline keyboard only to the first chunk so the
+            # buttons land with the pending-proposal section.
+            body["reply_markup"] = reply_markup
+        data = json.dumps(body).encode()
         req = urllib.request.Request(
-            url, data=body,
+            url, data=data,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
@@ -308,17 +319,46 @@ def _send_telegram(chat_id: str, text: str, token: str) -> bool:
     return True
 
 
+def _build_proposal_keyboard(pending: List[dict]) -> dict:
+    """Build inline_keyboard markup: one row of 3 buttons per proposal.
+    callback_data format: sri:approve:57 | sri:reject:57 | sri:modify:57
+    Telegram caps callback_data at 64 bytes; "sri:approve:NNNNNNNN" is well under."""
+    rows = []
+    for p in pending:
+        pid = p["id"]
+        rows.append([
+            {"text": "✅ Approve",   "callback_data": f"sri:approve:{pid}"},
+            {"text": "❌ Reject",    "callback_data": f"sri:reject:{pid}"},
+            {"text": "✏️ Modify",    "callback_data": f"sri:modify:{pid}"},
+        ])
+    return {"inline_keyboard": rows}
+
+
 def main() -> int:
     text = _build_digest()
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat = os.environ.get("TELEGRAM_HOME_CHANNEL", "").strip()
 
     if token and chat:
-        ok = _send_telegram(chat, text, token)
+        # Build the inline keyboard from currently-pending proposals only.
+        # (Re-queried here so a partial send doesn't lie about state.)
+        pending_rows: List[dict] = []
+        markup = None
+        try:
+            import sqlite3 as _sq
+            con = _sq.connect(DB)
+            con.row_factory = _sq.Row
+            pending_rows = load_pending(con.cursor())
+            con.close()
+            if pending_rows:
+                markup = _build_proposal_keyboard(pending_rows)
+        except Exception as e:
+            print(f"[digest] could not build keyboard: {e}", file=sys.stderr)
+        ok = _send_telegram(chat, text, token, reply_markup=markup)
         if ok:
-            print(f"[digest] Sent {len(text)}-char digest to {chat}")
+            print(f"[digest] Sent {len(text)}-char digest to {chat}"
+                  + (f" with {len(pending_rows)} button row(s)" if markup else ""))
             return 0
-        # fall through to print on send failure
     print(text)
     return 0
 

@@ -7,6 +7,7 @@ data/sri.db
 data/backups/
 data/judge_state.json
 data/branches/
+data/decision_state.json
 
 # Logs
 logs/

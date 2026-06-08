@@ -109,6 +109,21 @@ def _apply_unified_diff(target: Path, diff: str) -> bool:
             return False
         target.write_text(text.replace(old, new, 1))
         return True
+    # Heuristic fallback: if the diff is plain markdown/text with no
+    # recognized markers, treat it as an APPEND. This matches what the
+    # proposer typically produces (a new section to insert at the end
+    # of the target file) and unblocks the inline-button approve flow.
+    if diff.strip() and not any(
+        diff.startswith(p) for p in ("--- ", "APPEND:", "REPLACE_ALL:")
+    ) and "<<<" not in diff.splitlines()[0]:
+        _log("  diff has no recognized markers; defaulting to APPEND")
+        if target.exists():
+            with open(target, "a") as f:
+                f.write("\n" + diff.lstrip("\n"))
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(diff)
+        return True
     # Last resort: try as a unified diff anyway
     return _apply_patch(target, diff)
 
@@ -183,8 +198,16 @@ def apply_proposal(p: dict, cycle_id: str | None = None) -> bool:
         _log(f"    ✓ applied")
     else:
         _log(f"    ✗ apply failed, restoring from backup")
-        if backup.exists():
-            shutil.copy2(backup, target_p)
+        try:
+            if backup.exists():
+                if target_p.exists():
+                    shutil.copy2(backup, target_p)
+                else:
+                    # Target file was already missing when we started; can't
+                    # restore, and there was nothing to roll back. Just log.
+                    _log(f"    ! target {target_p} did not exist; nothing to restore")
+        except Exception as e:
+            _log(f"    ! rollback failed: {e}")
         # Phase 3: feed apply failures back. The proposer can then
         # propose: "fix the diff format" or "add a diff validator".
         try:
