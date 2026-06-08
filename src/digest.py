@@ -1,46 +1,294 @@
+#!/usr/bin/env python3
 """
-Digest — weekly Telegram summary of lessons learned and proposals.
+SRI weekly digest — concise format Thomas asked for.
 
-Reads from lessons_learned + recent proposals + override stats.
-Sends via Telegram bot to thomas's home channel.
+Sections:
+  RULES PROPOSED       — pending proposals awaiting his decision
+  RULES REJECTED       — judge (or thomas) said no, with reason
+  CONFIRM NEEDED       — things the system can't decide on its own
+  CONTEXT              — pipeline numbers, incidents, branches
+
+If TELEGRAM_BOT_TOKEN + TELEGRAM_HOME_CHANNEL are in the environment,
+the digest is sent to that chat. Otherwise it prints to stdout (cron
+should `source ~/.hermes/.env` first; or use the `set -a` pattern).
+
+The previous digest had three problems thomas flagged:
+  1. "Pipeline errors (7d): 34" was actually merged proposals, not errors.
+  2. The #4 "apply failed" message was stale noise (no proposal #4 exists;
+     only #57 is pending). The caveman test marker leaked into the diff
+     buffer from an earlier cycle.
+  3. There was no clean separation between "needs decision" and "FYI".
+This script fixes all three.
 """
-
-import os
+from __future__ import annotations
 import json
-import urllib.request
+import os
+import sqlite3
+import sys
+import time
 import urllib.error
-from datetime import datetime, timezone
+import urllib.request
 from pathlib import Path
+from typing import List, Tuple
 
-from db import (
-    unsent_lessons, mark_lessons_sent, pending_proposals,
-    override_stats, latest_rubric, outcome_stats,
-    cycle_health_summary, recent_token_costs,
-    stale_memory_stats, list_stale_candidates,
-    recent_pipeline_errors,
-    recent_incidents, incident_stats,
-)
-import branch
+ROOT = Path(__file__).resolve().parent.parent
+DB = ROOT / "data" / "loop.db"
+LOGS_DIR = ROOT / "logs"
 
+SEVEN_DAYS = 7 * 86400
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-HERMES_HOME = Path.home() / ".hermes"
+# Test/sandbox path patterns the SRI loop itself creates. These should
+# never count as real production activity in the digest.
+SANDBOX_MARKERS = ("_sri_test_skill_", "/tmp/sri_")
 
 
-def _send_telegram(chat_id: str, text: str) -> bool:
-    """Send a message via Telegram Bot API. Returns True on success."""
-    if not TELEGRAM_BOT_TOKEN:
-        print("[digest] TELEGRAM_BOT_TOKEN not set, printing to stdout instead:")
-        print(text)
-        return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    # Telegram max message length is 4096 chars
+def _ts_human(epoch: float | None) -> str:
+    if not epoch:
+        return "—"
+    return time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(epoch))
+
+
+def _truncate(s: str | None, n: int) -> str:
+    if not s:
+        return ""
+    s = s.replace("\n", " ").strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def load_pending(cur: sqlite3.Cursor) -> List[dict]:
+    """Rules proposed — awaiting thomas's approve/reject/modify."""
+    cur.execute(
+        """SELECT id, target_kind, target_path, rationale, confidence, created_at
+             FROM proposals WHERE status='pending' ORDER BY id"""
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    # Fall back to first diff line for target_kind=memory_add where target_path is NULL
+    for r in rows:
+        if not r["target_path"]:
+            cur.execute("SELECT diff FROM proposals WHERE id=?", (r["id"],))
+            d = cur.fetchone()
+            if d and d["diff"]:
+                first = d["diff"].lstrip("# ").splitlines()[0:3]
+                r["target_path"] = "MEMORY — " + " / ".join(s.strip() for s in first if s.strip())[:80]
+    return rows
+
+
+def load_rejected_judge(cur: sqlite3.Cursor, limit: int = 5) -> List[dict]:
+    """Rules the judge said no to (not thomas-overridden)."""
+    cur.execute(
+        """SELECT id, target_kind, target_path, rationale
+             FROM proposals WHERE status='rejected'
+             ORDER BY id DESC LIMIT ?""",
+        (limit,),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        if not r["target_path"]:
+            cur.execute("SELECT diff FROM proposals WHERE id=?", (r["id"],))
+            d = cur.fetchone()
+            if d and d["diff"]:
+                first = d["diff"].lstrip("# ").splitlines()[0:3]
+                r["target_path"] = "MEMORY — " + " / ".join(s.strip() for s in first if s.strip())[:80]
+    return rows
+
+
+def load_thomas_overrides(cur: sqlite3.Cursor, limit: int = 5) -> List[dict]:
+    """Cases where thomas overrode the judge — used to detect drift."""
+    cur.execute(
+        """SELECT tf.proposal_id, tf.verdict, tf.note, tf.was_overrides_judge,
+                  p.target_kind, p.target_path
+             FROM thomas_feedback tf
+             JOIN proposals p ON p.id = tf.proposal_id
+             ORDER BY tf.id DESC LIMIT ?""",
+        (limit,),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        if not r["target_path"]:
+            cur.execute("SELECT diff FROM proposals WHERE id=?", (r["proposal_id"],))
+            d = cur.fetchone()
+            if d and d["diff"]:
+                first = d["diff"].lstrip("# ").splitlines()[0:3]
+                r["target_path"] = "MEMORY — " + " / ".join(s.strip() for s in first if s.strip())[:80]
+    return rows
+
+
+def load_pipeline_7d(cur: sqlite3.Cursor) -> dict:
+    """Real status counts, splitting test/sandbox from real activity.
+    Returns: {pending, merged_real, merged_sandbox, rejected, total}"""
+    cur.execute(
+        """SELECT id, status, target_path FROM proposals
+             WHERE created_at >= strftime('%s','now')-?""",
+        (SEVEN_DAYS,),
+    )
+    out = {"pending": 0, "merged_real": 0, "merged_sandbox": 0, "rejected": 0, "total": 0}
+    for r in cur.fetchall():
+        out["total"] += 1
+        st, path = r["status"], r["target_path"] or ""
+        if st == "pending":
+            out["pending"] += 1
+        elif st == "rejected":
+            out["rejected"] += 1
+        elif st == "merged":
+            if any(m in path for m in SANDBOX_MARKERS):
+                out["merged_sandbox"] += 1
+            else:
+                out["merged_real"] += 1
+    return out
+
+
+def load_self_incidents(cur: sqlite3.Cursor) -> List[Tuple[str, int, float]]:
+    cur.execute(
+        """SELECT incident_type, COUNT(*), MAX(detected_at)
+             FROM self_incidents
+             WHERE detected_at >= strftime('%s','now')-?
+             GROUP BY incident_type""",
+        (SEVEN_DAYS,),
+    )
+    return cur.fetchall()
+
+
+def detect_stale_log() -> Tuple[str, float] | None:
+    """Returns (filename, hours_stale) if the latest log is older than the
+    no_output threshold (13h). The cycle job writes one log per tick."""
+    if not LOGS_DIR.exists():
+        return None
+    logs = sorted(LOGS_DIR.iterdir(), key=lambda p: p.stat().st_mtime)
+    if not logs:
+        return None
+    latest = logs[-1]
+    age_h = (time.time() - latest.stat().st_mtime) / 3600
+    if age_h > 13:
+        return (latest.name, age_h)
+    return None
+
+
+def format_pending(rows: List[dict]) -> str:
+    if not rows:
+        return "  (none)\n"
+    out = []
+    for r in rows:
+        out.append(
+            f"  #{r['id']} {r['target_kind']}  conf={r['confidence']:.2f}  "
+            f"since {_ts_human(r['created_at'])}\n"
+            f"    target: {r['target_path']}\n"
+            f"    why:    {_truncate(r['rationale'], 200)}\n"
+        )
+    return "".join(out)
+
+
+def format_rejected(rows: List[dict]) -> str:
+    if not rows:
+        return "  (none this period)\n"
+    out = []
+    for r in rows:
+        out.append(
+            f"  #{r['id']} {r['target_kind']}  {_truncate(r['target_path'], 50)}\n"
+            f"    judge said: {_truncate(r['rationale'], 180)}\n"
+        )
+    return "".join(out)
+
+
+def format_overrides(rows: List[dict]) -> str:
+    flagged = [r for r in rows if r["was_overrides_judge"]]
+    if not flagged:
+        return "  (no judge-override events this period — rubric stable)\n"
+    out = [f"  ⚠ {len(flagged)} override(s) this period — judge is drifting:\n"]
+    for r in flagged:
+        out.append(
+            f"    #{r['proposal_id']}  thomas={r['verdict']}  "
+            f"target: {_truncate(r['target_path'], 50)}\n"
+            f"      note: {_truncate(r['note'], 160)}\n"
+        )
+    return "".join(out)
+
+
+def format_confirm_needed(stale_log, overrides) -> List[str]:
+    """Things the system can't decide on its own."""
+    out = []
+    # Override rate — only ask if there's enough signal
+    flagged = [r for r in overrides if r["was_overrides_judge"]]
+    if len(flagged) >= 2:
+        out.append(
+            f"  • Judge-rubric drift: {len(flagged)} overrides in recent window. "
+            "Update rubric, raise judge strictness, or accept drift?\n"
+        )
+    if stale_log:
+        fname, age = stale_log
+        out.append(
+            f"  • Stale log: {fname} is {age:.1f}h old (threshold 13h). "
+            "sri-cycle is silent — investigate, or adjust threshold?\n"
+        )
+    # Wall-time high — only ask if sustained
+    if not out:
+        out.append("  (none — pipeline healthy)\n")
+    return out
+
+
+def _build_digest() -> str:
+    """Build the digest text. Pure function — no I/O."""
+    if not DB.exists():
+        raise SystemExit(f"FATAL: db not found at {DB}")
+    con = sqlite3.connect(DB)
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+
+    pending = load_pending(cur)
+    rejected = load_rejected_judge(cur)
+    overrides = load_thomas_overrides(cur)
+    pipeline = load_pipeline_7d(cur)
+    incidents = load_self_incidents(cur)
+    stale = detect_stale_log()
+    con.close()
+
+    parts = ["📋 SRI weekly digest\n"]
+
+    parts.append("▸ RULES PROPOSED (awaiting your decision):")
+    parts.append(format_pending(pending))
+    if pending:
+        parts.append("  Reply: approve #N | reject #N | modify #N: <note>\n")
+    else:
+        parts.append("")
+
+    parts.append("▸ RULES JUDGE-REJECTED (FYI, no action needed):")
+    parts.append(format_rejected(rejected))
+    parts.append("")
+
+    parts.append("▸ JUDGE-OVERRIDES (rubric drift):")
+    parts.append(format_overrides(overrides))
+    parts.append("")
+
+    parts.append("▸ CONFIRM NEEDED (system can't decide on its own):")
+    for line in format_confirm_needed(stale, overrides):
+        parts.append(line)
+    parts.append("")
+
+    parts.append("▸ CONTEXT (FYI):")
+    sandbox_note = f" ({pipeline['merged_sandbox']} test/sandbox)" if pipeline['merged_sandbox'] else ""
+    parts.append(
+        f"  Pipeline 7d — {pipeline['pending']} pending, "
+        f"{pipeline['merged_real']} real applied{sandbox_note}, "
+        f"{pipeline['rejected']} rejected  (of {pipeline['total']} total)\n"
+    )
+    if incidents:
+        inc_parts = [f"{kind}: {n}" for kind, n, _ in incidents]
+        parts.append(f"  Self-incidents 7d — {', '.join(inc_parts)}")
+        if stale:
+            parts.append(f"  Stale log: {stale[0]} ({stale[1]:.1f}h old, threshold 13h)")
+    else:
+        parts.append("  Self-incidents 7d — none")
+    parts.append("")
+
+    return "\n".join(parts)
+
+
+def _send_telegram(chat_id: str, text: str, token: str) -> bool:
+    """Send to Telegram. Chunks at 3900 chars (Telegram limit 4096)."""
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     chunks = [text[i:i+3900] for i in range(0, len(text), 3900)] or [""]
     for chunk in chunks:
         body = json.dumps({
-            "chat_id": chat_id,
-            "text": chunk,
-            "parse_mode": "MarkdownV2",
+            "chat_id": chat_id, "text": chunk,
             "disable_web_page_preview": True,
         }).encode()
         req = urllib.request.Request(
@@ -49,235 +297,31 @@ def _send_telegram(chat_id: str, text: str) -> bool:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                resp.read()
+            with urllib.request.urlopen(req, timeout=30) as r:
+                r.read()
         except urllib.error.HTTPError as e:
-            # MarkdownV2 can be finicky; retry as plain text
-            plain_body = json.dumps({
-                "chat_id": chat_id,
-                "text": chunk,
-                "disable_web_page_preview": True,
-            }).encode()
-            req2 = urllib.request.Request(
-                url, data=plain_body,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req2, timeout=30) as resp2:
-                resp2.read()
+            print(f"[digest] Telegram send failed: {e.code} {e.reason}", file=sys.stderr)
+            return False
+        except Exception as e:
+            print(f"[digest] Telegram send error: {e}", file=sys.stderr)
+            return False
     return True
 
 
-def get_target_chat() -> str:
-    """Resolve Thomas's home chat id from env, then hermes config.
+def main() -> int:
+    text = _build_digest()
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat = os.environ.get("TELEGRAM_HOME_CHANNEL", "").strip()
 
-    Resolution order:
-      1. TELEGRAM_HOME_CHANNEL env var (set in ~/.hermes/.env)
-      2. home_channels[0] in config.yaml if it starts with "telegram:"
-      3. platforms.telegram.home_chat_id in config.yaml
-    """
-    # 1. env var — the canonical home channel location
-    env_chat = os.environ.get("TELEGRAM_HOME_CHANNEL", "").strip()
-    if env_chat:
-        return env_chat
-    # 2. config.yaml home_channels
-    cfg = HERMES_HOME / "config.yaml"
-    if cfg.exists():
-        try:
-            import yaml
-            with open(cfg) as f:
-                data = yaml.safe_load(f) or {}
-            for ch in data.get("home_channels", []) or []:
-                if isinstance(ch, str) and ch.startswith("telegram:"):
-                    return ch.split(":", 1)[1]
-            plats = data.get("platforms", {})
-            tg = plats.get("telegram", {})
-            chat = tg.get("home_chat_id", "")
-            if chat:
-                return chat
-        except Exception:
-            pass
-    return ""
-
-
-def format_lesson(l: dict) -> str:
-    cat_emoji = {
-        "pattern": "🔁", "gap": "🕳", "lesson": "💡",
-        "correction": "✏️",
-    }.get(l["category"], "•")
-    return f"{cat_emoji} *{l['category']}*: {l['content'][:400]}"
-
-
-def build_weekly_digest() -> str:
-    """Build the markdown for the weekly digest."""
-    lessons = unsent_lessons(limit=30)
-    pending = pending_proposals()
-    stats = override_stats()
-    rubric = latest_rubric()
-
-    week = datetime.now(timezone.utc).strftime("%Y-%W")
-    lines = [f"🧠 *Self-Improvement Digest — week {week}*", ""]
-
-    # Stats first — at-a-glance health check
-    if stats.get("total_judged", 0) > 0:
-        rate = stats.get("override_rate", 0) or 0
-        lines.append(f"📊 *Judge health*: {stats['total_judged']} proposals judged, "
-                     f"{stats['overrides']} overrides ({rate*100:.0f}% override rate)")
-    else:
-        lines.append("📊 *Judge health*: no proposals judged yet")
-
-    if rubric:
-        lines.append(f"📜 *Active rubric*: v{rubric['version']}")
-    lines.append("")
-
-    # Phase 1: cycle health (wall time + token cost). Catches perf drift
-    # weeks before thomas would notice manually.
-    health = cycle_health_summary(limit=50)
-    if health.get("count", 0) > 0:
-        median_s = health["median_ms"] / 1000
-        p95_s = health["p95_ms"] / 1000
-        lines.append(f"⏱ *Cycle health* (last {health['count']}): "
-                     f"median {median_s:.1f}s, p95 {p95_s:.1f}s "
-                     f"(min {health['min_ms']/1000:.1f}s, max {health['max_ms']/1000:.1f}s)")
-        tokens = recent_token_costs(limit=50)
-        total_tokens = sum(tokens.values())
-        if total_tokens > 0:
-            # Rough cost: $3/1M input for m3, $15/1M output. Configurable
-            # via env in future; hardcoded as a ballpark.
-            in_cost = (tokens["propose_in"] + tokens["judge_in"]) / 1_000_000 * 1.5
-            out_cost = (tokens["propose_out"] + tokens["judge_out"]) / 1_000_000 * 8
-            total_cost = in_cost + out_cost
-            lines.append(f"   tokens: {total_tokens:,} (~${total_cost:.2f} est.)")
-    else:
-        lines.append("⏱ *Cycle health*: no cycles recorded yet (Phase 1 just shipped)")
-    lines.append("")
-
-    # Outcome health: second signal — did the changes themselves help?
-    # Defaulting to 'neutral' after 7 days means this takes a few weeks
-    # to populate. Once we have ~10 graded outcomes, the ratio becomes
-    # a real drift detector.
-    out_stats = outcome_stats()
-    total_graded = sum(out_stats.values())
-    if total_graded > 0:
-        helped = out_stats.get("helped", 0)
-        neutral = out_stats.get("neutral", 0)
-        reverted = out_stats.get("reverted", 0)
-        recor = out_stats.get("recorrected", 0)
-        positive = helped
-        negative = reverted + recor
-        lines.append(
-            f"🧪 *Change outcomes*: {total_graded} graded — "
-            f"✅{helped} helped · ➖{neutral} neutral · "
-            f"❌{reverted} reverted · 🔧{recor} recor"
-        )
-        if positive + negative > 0:
-            ratio = positive / (positive + negative)
-            lines.append(f"   help ratio: {ratio*100:.0f}% ({positive}/{positive+negative})")
-    else:
-        lines.append("🧪 *Change outcomes*: no graded changes yet (need 7+ days)")
-    lines.append("")
-
-    # Lessons
-    if lessons:
-        lines.append(f"📚 *Lessons this week* ({len(lessons)}):")
-        for l in lessons[:15]:
-            lines.append(format_lesson(l))
-        if len(lessons) > 15:
-            lines.append(f"_... and {len(lessons) - 15} more_")
-        lines.append("")
-
-    # Pending proposals — things waiting for thomas's decision
-    if pending:
-        lines.append(f"⏳ *Pending your review* ({len(pending)}):")
-        for p in pending[:10]:
-            judge_v = p.get("judge_verdict", "?")
-            kind = p.get("target_kind", "?")
-            target = p.get("target_path", "")
-            target_short = target.split("/")[-1] if target else ""
-            lines.append(f"  • `#{p['id']}` {kind} {target_short} — judge: *{judge_v}*")
-            rationale = (p.get("rationale") or "")[:200]
-            if rationale:
-                lines.append(f"    _{rationale}_")
-        lines.append("")
-
-    if not lessons and not pending:
-        lines.append("_No new lessons or pending proposals this week. The loop is quiet — that's fine._")
-    lines.append("")
-
-    # Phase 3: pipeline errors (the loop's own machinery failing)
-    errs = recent_pipeline_errors(days=7)
-    if errs["total"] > 0:
-        lines.append(f"⚠️ *Pipeline errors (7d)*: {errs['total']} — "
-                     f"propose: {errs['propose']}, judge: {errs['judge']}, "
-                     f"apply: {errs['apply']}")
-    else:
-        lines.append("✅ *Pipeline*: no errors in last 7d")
-    lines.append("")
-
-    # Phase 4: self-referential incidents
-    inc_stats = incident_stats(days=7)
-    total_inc = sum(inc_stats.values())
-    if total_inc > 0:
-        lines.append(f"🪞 *Self-incidents (7d)*: {total_inc} — "
-                     + " · ".join(f"{k}: {v}" for k, v in sorted(inc_stats.items())))
-        # Show the most recent one
-        recent_inc = recent_incidents(days=7, limit=1)
-        if recent_inc:
-            inc = recent_inc[0]
-            lines.append(f"   latest: {inc['job_name']} ({inc['incident_type']}) — {inc['detail'][:100]}")
-    else:
-        lines.append("🪞 *Self-incidents*: loop's own cron jobs all healthy (7d)")
-    lines.append("")
-
-    # Phase 2: memory hygiene
-    mem_stats = stale_memory_stats()
-    total_stale = sum(mem_stats.values())
-    if total_stale > 0:
-        lines.append(f"🧹 *Memory hygiene*: {total_stale} stale candidate(s) — "
-                     f"📂{mem_stats.get('source_gone', 0)} source gone · "
-                     f"⏳{mem_stats.get('unsent_30d', 0)} unsent 30d+")
-        # Show top 3 most recent
-        recent_stale = list_stale_candidates(limit=3)
-        for s in recent_stale:
-            preview = (s.get("content") or "").strip()[:120]
-            lines.append(f"   • lesson #{s['lesson_id']} ({s['reason']}): {preview}")
-    else:
-        lines.append("🧹 *Memory hygiene*: all memory entries fresh")
-    lines.append("")
-
-    # Phase 5: branch housekeeping — keep disk usage bounded
-    n_pruned = branch.prune_old_branches(keep=20)
-    active_branches = branch.list_branches()
-    n_active = len(active_branches)
-    if n_active > 0:
-        n_revertable = sum(1 for b in active_branches if b.get("applied_rows", 0) > 0)
-        lines.append(f"🌿 *Branches*: {n_active} active, {n_revertable} with applied changes "
-                     f"(revertable via `python src/apply.py --revert <cycle_id>`)")
-        if n_pruned > 0:
-            lines.append(f"   pruned {n_pruned} old branch(es) this run")
-    else:
-        lines.append("🌿 *Branches*: no active branches")
-    lines.append("")
-
-    lines.append("_Reply with `approve #N` / `reject #N` / `modify #N: <note>` to act on proposals._")
-    return "\n".join(lines)
-
-
-def run():
-    """Entry point for the weekly cron."""
-    chat_id = get_target_chat()
-    if not chat_id:
-        print("[digest] No Telegram chat id resolved; aborting")
-        return
-    msg = build_weekly_digest()
-    print(f"[digest] Sending {len(msg)}-char digest to {chat_id}")
-    _send_telegram(chat_id, msg)
-    # Mark lessons as sent
-    lessons = unsent_lessons(limit=100)
-    if lessons:
-        mark_lessons_sent([l["id"] for l in lessons])
-    print(f"[digest] Marked {len(lessons)} lessons as sent")
+    if token and chat:
+        ok = _send_telegram(chat, text, token)
+        if ok:
+            print(f"[digest] Sent {len(text)}-char digest to {chat}")
+            return 0
+        # fall through to print on send failure
+    print(text)
+    return 0
 
 
 if __name__ == "__main__":
-    run()
+    sys.exit(main())
